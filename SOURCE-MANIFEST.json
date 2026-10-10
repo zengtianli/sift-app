@@ -203,7 +203,7 @@
     "THIRD-PARTY-LICENSES/zstd-sys-2.1.0+zstd.1.5.7/LICENSE": "ce4868c8e4ebe47a7d4b3c93dbf6b802033e5ae2fa7638098173f80836daac60",
     "THIRD-PARTY-LICENSES/zstd-sys-2.1.0+zstd.1.5.7/LICENSE.BSD-3-Clause": "bf7017a73a95ea63bf3716b13ec2bcd79c92942356e3408c6fb66332bad6d977",
     "THIRD-PARTY-NOTICES.md": "ee918f6a263d4a15363fe11f5d0a0ae15888fd783cba2fcdfb7882be74e9c72a",
-    "build.sh": "0bb92c379f8b635772bd4d91bd13259daee4ca426d700b42404a34e2032f3b15",
+    "build.sh": "8be8011bafd1df55ccccd5af8f58a86ee173336f51290db7d6b9b047e533e008",
     "core/Cargo.lock": "ad6d5b73b810afbb6f8617e28db668f94332a9da2d5116a847bd01c9068c861b",
     "core/Cargo.toml": "8e9beeb2f03a91b3660b19d01f21179e7b0c3c1dafc479e9764df6b47e1c33ef",
     "core/include/module.modulemap": "c43bf8dda1d368d582b3e39e3ce39d8ab5ead021c8785aee74e378fecd62e373",

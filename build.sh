@@ -8,7 +8,7 @@ TARGET_DIR="${CARGO_TARGET_DIR:-$DIR/core/target}"
 # Keep machine paths and private build-directory names out of compiled binaries.
 export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=/build --remap-path-prefix=$DIR=."
 # Keep proc-macro dylibs intact; Apple strip can misalign their LINKEDIT pool.
-export CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP=none
+export CARGO_PROFILE_RELEASE_STRIP=none
 test -d third_party/cardinal/search-cache
 (cd core && MACOSX_DEPLOYMENT_TARGET=14.0 "$CARGO" build --release --locked -j "${CARGO_BUILD_JOBS:-12}")
 mkdir -p build
@@ -27,6 +27,7 @@ xcrun swiftc -swift-version 5 -O -whole-module-optimization -target arm64-apple-
   -framework CoreServices -framework Carbon -framework Quartz \
   "${SOURCES[@]}" -o "$APP/Contents/MacOS/Sift"
 cp "$TARGET_DIR/release/sift" "$APP/Contents/Resources/bin/sift"
+strip -x "$APP/Contents/Resources/bin/sift"
 strip -x "$APP/Contents/MacOS/Sift"
 IDENTITY="${CODESIGN_IDENTITY:--}"
 if [ "$IDENTITY" = '-' ]; then

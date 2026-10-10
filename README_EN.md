@@ -8,7 +8,7 @@ Search as you type, narrow searches to folders, match case, filter names, sizes 
 
 ## Installation
 
-Requires an Apple Silicon Mac running macOS 14 or later. Distribution packages will be attached to [Releases](https://github.com/zengtianli/sift-app/releases). Check each release's actual assets: releases without an app archive provide source only. Distribution packages must have Developer ID signing, notarization and a stapled ticket.
+Requires an Apple Silicon Mac running macOS 14 or later. [Download the distribution ZIP](https://github.com/zengtianli/sift-app/releases/download/v0.1.1/Sift-0.1.1-arm64.zip); the public package is Developer ID signed, notarized and stapled. New packages and checksums are listed in [Releases](https://github.com/zengtianli/sift-app/releases).
 
 Extract the ZIP and move `Sift.app` to Applications. To search protected directories, personally grant Sift access in System Settings → Privacy & Security → Full Disk Access.
 

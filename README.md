@@ -8,7 +8,7 @@
 
 ## 安装
 
-需要 Apple Silicon Mac 和 macOS 14 或更新版本。正式安装包会放在 [Releases](https://github.com/zengtianli/sift-app/releases)，以每个 Release 的实际附件为准；没有安装包的 Release 仅提供源码。正式包必须经过 Developer ID 签名、公证和装订。
+需要 Apple Silicon Mac 和 macOS 14 或更新版本。[下载正式 ZIP](https://github.com/zengtianli/sift-app/releases/download/v0.1.1/Sift-0.1.1-arm64.zip)；正式包已使用 Developer ID 签名，并完成 Apple 公证和装订。新版与校验文件以 [Releases](https://github.com/zengtianli/sift-app/releases) 的实际附件为准。
 
 下载 ZIP 后解压，将 `Sift.app` 放入「应用程序」。需要搜索受保护目录时，请本人在「系统设置 → 隐私与安全性 → 完全磁盘访问」中授权 Sift。
 

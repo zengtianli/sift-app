@@ -1,0 +1,5 @@
+# Third-party notices
+
+Sift includes a modified Rust indexing engine from [Cardinal](https://github.com/cardisoft/cardinal), MIT License, Copyright (c) 2025 Cardinal Contributors. Its complete license is in `third_party/cardinal/LICENSE`. The bundled fork contains arena-based name storage, compact name indexes, streaming snapshots and file-event filtering improvements.
+
+Other Rust dependencies are recorded in `core/Cargo.lock` and the vendored manifests. Their licenses remain applicable to their respective components. The dependency inventory in `DEPENDENCIES.json` records the macOS-resolved packages and their declared licenses. Bundled Cardinal crates without a manifest license field are covered by Cardinal's root MIT license. Available dependency license texts are preserved in `THIRD-PARTY-LICENSES/`. Licenses include MIT, Apache-2.0, BSD-3-Clause, Zlib, Unicode-3.0 and WTFPL; the MIT license on Sift does not replace those notices. Platform-specific libraries may be present in the lockfile without being linked into the macOS app. This repository does not include Xcode, the macOS SDK or third-party signing credentials.

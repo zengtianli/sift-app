@@ -1,0 +1,36 @@
+[package]
+name = "sift-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Sift engine: Cardinal's file index behind a C ABI, a local socket and a CLI"
+
+[lib]
+name = "sift_core"
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "sift"
+path = "src/bin/sift.rs"
+
+[dependencies]
+search-cache = { path = "../third_party/cardinal/search-cache" }
+search-cancel = { path = "../third_party/cardinal/search-cancel" }
+cardinal-sdk = { path = "../third_party/cardinal/cardinal-sdk" }
+fswalk = { path = "../third_party/cardinal/fswalk" }
+crossbeam-channel = "0.5.15"
+rayon = "1"
+anyhow = "1.0.97"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+debug = false
+
+[workspace]

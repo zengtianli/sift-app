@@ -1,0 +1,5 @@
+/build/
+/core/target/
+/third_party/cardinal/target/
+.DS_Store
+*.dSYM/

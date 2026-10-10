@@ -1,0 +1,5 @@
+module SiftCore {
+  header "sift_core.h"
+  link "sift_core"
+  export *
+}

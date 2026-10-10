@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = [
+  "lsf",
+  "cardinal-sdk",
+  "fswalk",
+  "namepool",
+  "was",
+  "fs-icon",
+  "file-tags",
+  "query-segmentation",
+  "cardinal-syntax",
+  "search-cancel",
+  "slab-mmap",
+]
+exclude = ["cardinal"]

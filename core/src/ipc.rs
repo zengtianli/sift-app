@@ -203,6 +203,20 @@ fn search(req: Request, engine: &Engine, out: &mut impl Write) -> Result<()> {
         None => None,
         Some(s) => Some(SortKey::parse(s).with_context(|| format!("unknown sort key {s:?}"))?),
     };
+    if let Some(limit) = req.limit.filter(|limit| *limit <= ROW_CHUNK) {
+        let page = engine.search_page(req.dir, req.query, req.case_insensitive, sort, req.desc, req.offset, limit)?;
+        let s = &engine.status;
+        let hits: Vec<_> = page.rows.into_iter().map(|node| Hit::from(Row::from(node))).collect();
+        let mut value = json!({"ok": true, "live": true, "total": page.total, "offset": page.offset,
+            "search_ms": page.took.as_secs_f64() * 1000.0, "case_insensitive": req.case_insensitive,
+            "state": s.state().as_str(), "rebuild_required": s.rebuild_required.load(Ordering::Relaxed),
+            "repairing": s.repairing.load(Ordering::Relaxed), "results": hits});
+        if let Some(loosened) = page.loosened { value["loosened"] = json!(loosened); }
+        serde_json::to_writer(&mut *out, &value)?;
+        out.write_all(b"\n")?;
+        out.flush()?;
+        return Ok(());
+    }
     let Some((outcome, took, revision)) = engine.search_versioned(req.dir, req.query, req.case_insensitive, false)? else {
         bail!("search was superseded by a newer one");
     };

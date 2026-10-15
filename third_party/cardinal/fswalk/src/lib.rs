@@ -213,7 +213,15 @@ impl<'w, F: Fn() -> bool> WalkData<'w, F> {
 pub fn walk_it_without_root_chain<F: Fn() -> bool + Send + Sync>(
     walk_data: &WalkData<'_, F>,
 ) -> Option<Node> {
-    walk(walk_data.root_path, walk_data)
+    walk::<true, _>(walk_data.root_path, walk_data)
+}
+
+/// Incremental directory scans share traversal semantics without waking a Rayon
+/// worker pool for each short filesystem event batch.
+pub fn walk_it_without_root_chain_serial<F: Fn() -> bool + Send + Sync>(
+    walk_data: &WalkData<'_, F>,
+) -> Option<Node> {
+    walk::<false, _>(walk_data.root_path, walk_data)
 }
 
 /// return `Some(Node)` if walk is successful.
@@ -222,7 +230,7 @@ pub fn walk_it_without_root_chain<F: Fn() -> bool + Send + Sync>(
 /// Note: if the root path is missing or inaccessible, it will still return
 /// `Some(Node)` with empty children and None metadata.
 pub fn walk_it<F: Fn() -> bool + Send + Sync>(walk_data: &WalkData<'_, F>) -> Option<Node> {
-    walk(walk_data.root_path, walk_data).map(|node_tree| {
+    walk::<true, _>(walk_data.root_path, walk_data).map(|node_tree| {
         if let Some(parent) = walk_data.root_path.parent() {
             let mut path = PathBuf::from(parent);
             let mut node = Node {
@@ -258,7 +266,7 @@ pub fn walk_it<F: Fn() -> bool + Send + Sync>(walk_data: &WalkData<'_, F>) -> Op
 
 /// Note: this function will create a Node for the given path even if it's
 /// missing or inaccessible, but the metadata will be None in that case.
-fn walk<F: Fn() -> bool + Send + Sync>(path: &Path, walk_data: &WalkData<'_, F>) -> Option<Node> {
+fn walk<const PARALLEL: bool, F: Fn() -> bool + Send + Sync>(path: &Path, walk_data: &WalkData<'_, F>) -> Option<Node> {
     let metadata = metadata_of_path(path);
     let children = if metadata.as_ref().map(|x| x.is_dir()).unwrap_or_default() {
         walk_data.num_dirs.fetch_add(1, Ordering::Relaxed);
@@ -266,10 +274,7 @@ fn walk<F: Fn() -> bool + Send + Sync>(path: &Path, walk_data: &WalkData<'_, F>)
         match read_dir {
             Ok(entries) => {
                 let cancelled = AtomicBool::new(false);
-                let results: Vec<_> = entries
-                    .into_iter()
-                    .par_bridge()
-                    .map(|entry| {
+                let visit = |entry: std::io::Result<std::fs::DirEntry>| {
                         match &entry {
                             Ok(entry) => {
                                 if walk_data.is_cancelled() {
@@ -283,7 +288,7 @@ fn walk<F: Fn() -> bool + Send + Sync>(path: &Path, walk_data: &WalkData<'_, F>)
                                 // doesn't traverse symlink
                                 if let Ok(data) = entry.file_type() {
                                     if data.is_dir() {
-                                        walk(&path, walk_data)
+                                        walk::<PARALLEL, _>(&path, walk_data)
                                     } else {
                                         walk_data.num_files.fetch_add(1, Ordering::Relaxed);
                                         let name = entry
@@ -309,8 +314,12 @@ fn walk<F: Fn() -> bool + Send + Sync>(path: &Path, walk_data: &WalkData<'_, F>)
                             }
                             Err(_) => None,
                         }
-                    })
-                    .collect();
+                    };
+                let results: Vec<_> = if PARALLEL {
+                    entries.par_bridge().map(visit).collect()
+                } else {
+                    entries.map(visit).collect()
+                };
                 if cancelled.load(Ordering::Acquire) {
                     return None;
                 }
@@ -391,6 +400,27 @@ mod tests {
             }
         }
         current
+    }
+
+    #[test]
+    fn serial_incremental_walk_matches_parallel_tree_and_cancellation() {
+        let tmp = TempDir::new("fswalk_serial_parity").unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("folder/deep")).unwrap();
+        fs::create_dir_all(root.join("skip")).unwrap();
+        fs::write(root.join("folder/deep/file.txt"), b"metadata").unwrap();
+        fs::write(root.join("skip/ignored.txt"), b"ignored").unwrap();
+        std::os::unix::fs::symlink(root.join("folder"), root.join("link")).unwrap();
+        let ignore = [root.join("skip")];
+        let parallel = WalkData::new(root, &ignore, &[], true, || false);
+        let serial = WalkData::new(root, &ignore, &[], true, || false);
+        let expected = walk_it_without_root_chain(&parallel).unwrap();
+        let actual = walk_it_without_root_chain_serial(&serial).unwrap();
+        assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        assert_eq!(serial.num_files.load(Ordering::Relaxed), parallel.num_files.load(Ordering::Relaxed));
+        assert_eq!(serial.num_dirs.load(Ordering::Relaxed), parallel.num_dirs.load(Ordering::Relaxed));
+        let cancelled = WalkData::new(root, &ignore, &[], true, || true);
+        assert!(walk_it_without_root_chain_serial(&cancelled).is_none());
     }
 
     #[test]

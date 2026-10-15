@@ -26,16 +26,12 @@ fn background_pool(name: &'static str, threads: usize) -> Option<rayon::ThreadPo
         .ok()
 }
 
-/// Incremental directory walks use the same `par_bridge` as a full walk. Installing
-/// these short, frequent jobs in the global pool wakes every search worker before
-/// they spin/park again. Keep their work on one persistent background worker;
-/// searches and initial walks retain the global pool, repairs retain their own two.
-pub fn incremental<T: Send>(work: impl FnOnce() -> T + Send) -> T {
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-    match POOL.get_or_init(|| background_pool("sift-incremental", 1)) {
-        Some(pool) => pool.install(work),
-        None => work(), // Thread creation failure must not drop file events.
-    }
+/// The incremental walker is serial. Run it on the index thread at background
+/// QoS, without a Rayon install/unpark/spin/park cycle for each small batch.
+/// Queries restore their prior QoS; full walks and two-thread repairs stay parallel.
+pub fn incremental<T>(work: impl FnOnce() -> T) -> T {
+    let _priority = BackgroundPriority::enter();
+    work()
 }
 
 /// A repair waits while the whole Mac is at least this busy…
@@ -215,16 +211,16 @@ mod tests {
 
     #[test]
     fn incremental_walk_keeps_results_and_does_not_wake_search_workers() {
-        use rayon::iter::{ParallelBridge, ParallelIterator};
         let global_threads = rayon::current_num_threads();
-        let mut seen = incremental(|| (0..256).par_bridge().map(|value| {
+        let caller = std::thread::current().id();
+        let mut seen = incremental(|| (0..256).map(|value| {
             let (mut class, mut relative) = (0u32, 0i32);
             unsafe { pthread_get_qos_class_np(pthread_self(), &mut class, &mut relative) };
-            (value, std::thread::current().name().unwrap_or("").to_owned(), class)
+            (value, std::thread::current().id(), class)
         }).collect::<Vec<_>>());
         seen.sort_by_key(|row| row.0);
         assert_eq!(seen.iter().map(|row| row.0).collect::<Vec<_>>(), (0..256).collect::<Vec<_>>());
-        assert!(seen.iter().all(|row| row.1 == "sift-incremental-0" && row.2 == QOS_CLASS_BACKGROUND));
+        assert!(seen.iter().all(|row| row.1 == caller && row.2 == QOS_CLASS_BACKGROUND));
         assert_eq!(rayon::current_num_threads(), global_threads);
     }
     #[test]

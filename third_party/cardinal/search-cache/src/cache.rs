@@ -9,8 +9,10 @@ use anyhow::{Context, Result, anyhow};
 use cardinal_sdk::{EventFlag, FsEvent, ScanType, current_event_id};
 use cardinal_syntax::{Expr, Filter, FilterKind, Term, optimize_query, parse_query};
 use fswalk::{
-    Node, NodeMetadata, WalkData, should_ignore_path, walk_it, walk_it_without_root_chain,
+    Node, NodeMetadata, WalkData, should_ignore_path, walk_it,
 };
+#[cfg(test)]
+use fswalk::walk_it_without_root_chain;
 use hashbrown::HashSet;
 use namepool::NamePool;
 use search_cancel::CancellationToken;
@@ -788,7 +790,7 @@ impl SearchCache {
             true,
             || self.stop.load(Ordering::Relaxed),
         );
-        walk_it_without_root_chain(&walk_data).map(|node| {
+        fswalk::walk_it_without_root_chain_serial(&walk_data).map(|node| {
             let node = self.create_node_slab_update_name_index_and_name_pool(Some(parent), &node);
             // Push the newly created node to the parent's children
             self.file_nodes[parent].add_children(node);
@@ -971,6 +973,24 @@ impl SearchCache {
             .collect()
     }
 
+    fn refresh_directory_metadata(&mut self, event: &FsEvent) -> bool {
+        let metadata_flags = EventFlag::ItemInodeMetaMod | EventFlag::ItemFinderInfoMod
+            | EventFlag::ItemChangeOwner | EventFlag::ItemXattrMod;
+        let allowed = metadata_flags | EventFlag::ItemIsDir | EventFlag::OwnEvent;
+        if !event.flag.contains(EventFlag::ItemIsDir) || !event.flag.intersects(metadata_flags)
+            || !(event.flag & !allowed).is_empty() {
+            return false;
+        }
+        let Some(index) = self.node_index_for_path(&event.path) else { return false; };
+        if self.file_nodes[index].metadata.file_type_hint() != fswalk::NodeFileType::Dir { return false; }
+        let Ok(metadata) = event.path.symlink_metadata() else { return false; };
+        if !metadata.is_dir() { return false; }
+        // chmod/xattr/inode metadata changes do not invalidate descendants.
+        // Refresh the directory itself, keeping every child identity intact.
+        self.file_nodes[index].metadata = SlabNodeMetadataCompact::some(NodeMetadata::from(metadata));
+        true
+    }
+
     pub fn handle_fs_events(&mut self, events: Vec<FsEvent>) -> Result<(), HandleFSEError> {
         let max_event_id = events.iter().map(|e| e.id).max();
         // If rescan needed, early exit.
@@ -988,6 +1008,9 @@ impl SearchCache {
             self.rescan_count = self.rescan_count.saturating_add(1);
             return Err(HandleFSEError::Rescan);
         }
+        // Remove metadata-only parents before ancestor coalescing: a child with
+        // a real content/create/delete event must still be processed on its own.
+        let events = events.into_iter().filter(|event| !self.refresh_directory_metadata(event)).collect();
         for scan_path in scan_paths(events) {
             info!("Scanning path: {scan_path:?}");
             let folder = self.scan_path_recursive(&scan_path);
@@ -2664,6 +2687,44 @@ mod tests {
                 .node_index_for_path(&root.join("new_dir/file.txt"))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn directory_metadata_events_keep_children_and_do_not_hide_child_changes() {
+        let temp = TempDir::new("directory_metadata").unwrap();
+        let parent = temp.path().join("folder");
+        fs::create_dir_all(parent.join("deep")).unwrap();
+        let child = parent.join("deep/file.txt");
+        fs::write(&child, b"old").unwrap();
+        let mut cache = SearchCache::walk_fs(temp.path());
+        let directory_index = cache.node_index_for_path(&parent).unwrap();
+        let child_index = cache.node_index_for_path(&child).unwrap();
+        let id = cache.last_event_id() + 1;
+        fs::write(&child, vec![0u8; 1234]).unwrap();
+        fs::File::open(&parent).unwrap().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(12345)).unwrap();
+        cache.handle_fs_events(vec![
+            FsEvent { path: parent.clone(), flag: EventFlag::ItemIsDir | EventFlag::ItemInodeMetaMod, id },
+            FsEvent { path: child.clone(), flag: EventFlag::ItemIsFile | EventFlag::ItemModified, id: id + 1 },
+        ]).unwrap();
+        assert_eq!(cache.node_index_for_path(&parent), Some(directory_index));
+        assert_eq!(cache.node_index_for_path(&child), Some(child_index));
+        assert_eq!(cache.node_metadata(child_index).unwrap().as_ref().unwrap().size(), 1234);
+        assert_eq!(cache.node_metadata(directory_index).unwrap().as_ref().unwrap().mtime().unwrap().get(), 12345);
+        assert_eq!(cache.last_event_id(), id + 1);
+
+        // A mixed metadata/rename event still recursively discovers new children.
+        let new_child = parent.join("deep/new.txt");
+        fs::write(&new_child, b"new").unwrap();
+        cache.handle_fs_events(vec![FsEvent { path: parent.clone(),
+            flag: EventFlag::ItemIsDir | EventFlag::ItemInodeMetaMod | EventFlag::ItemRenamed, id: id + 2 }]).unwrap();
+        assert!(cache.node_index_for_path(&new_child).is_some());
+        // A stale directory hint after a type change must take the complete path.
+        fs::remove_dir_all(&parent).unwrap();
+        fs::write(&parent, b"file").unwrap();
+        cache.handle_fs_events(vec![FsEvent { path: parent.clone(),
+            flag: EventFlag::ItemIsDir | EventFlag::ItemInodeMetaMod, id: id + 3 }]).unwrap();
+        assert!(cache.node_index_for_path(&new_child).is_none());
+        assert_eq!(cache.node_metadata(cache.node_index_for_path(&parent).unwrap()).unwrap().as_ref().unwrap().size(), 4);
     }
 
     #[test]

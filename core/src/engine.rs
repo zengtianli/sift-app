@@ -8,7 +8,7 @@
 use crate::config::Config;
 use crate::query::SearchOutcome;
 use crate::recovery::{BackgroundPriority, HostLoad, RecoverySchedule, repair_pool, writer_lock};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cardinal_sdk::{EventFlag, EventWatcher, FsEvent};
 use crossbeam_channel::{Receiver, Sender, bounded, never, select, tick, unbounded};
 use search_cache::{
@@ -173,6 +173,15 @@ impl SortKey {
 }
 
 enum Cmd {
+    Page {
+        query: SearchQuery,
+        options: SearchOptions,
+        sort: Option<SortKey>,
+        descending: bool,
+        offset: usize,
+        limit: usize,
+        reply: Sender<Result<SearchPage>>,
+    },
     Search {
         query: SearchQuery,
         options: SearchOptions,
@@ -205,6 +214,16 @@ enum Cmd {
     },
 }
 
+/// One bounded CLI page resolved under one index ownership interval. Large
+/// exports retain the existing chunked/revision-checked path.
+pub struct SearchPage {
+    pub total: usize,
+    pub offset: usize,
+    pub took: Duration,
+    pub loosened: Option<String>,
+    pub rows: Vec<SearchResultNode>,
+}
+
 pub struct Engine {
     tx: Sender<Cmd>,
     pub status: Arc<Status>,
@@ -219,6 +238,19 @@ pub struct Engine {
 }
 
 impl Engine {
+    pub fn search_page(&self, directory: Option<String>, query: Option<String>,
+        case_insensitive: bool, sort: Option<SortKey>, descending: bool,
+        offset: usize, limit: usize) -> Result<SearchPage> {
+        anyhow::ensure!(limit <= 4096, "atomic search pages are limited to 4096 rows");
+        let (reply, rx) = bounded(1);
+        self.send(Cmd::Page {
+            query: SearchQuery {
+                directory_query: directory.filter(|s| !s.trim().is_empty()),
+                query: query.filter(|s| !s.trim().is_empty()).map(crate::query::normalize),
+            }, options: SearchOptions { case_insensitive }, sort, descending, offset, limit, reply,
+        })?;
+        rx.recv()?
+    }
     pub fn start(config: Config) -> Arc<Self> {
         Self::try_start(config).expect("cannot acquire Sift index ownership")
     }
@@ -655,6 +687,23 @@ impl Loop {
     /// Returns the shutdown reply channel when asked to stop.
     fn handle(&mut self, cmd: Cmd) -> Option<Sender<()>> {
         match cmd {
+            Cmd::Page { query, options, sort, descending, offset, limit, reply } => {
+                self.last_activity = Instant::now();
+                let started = Instant::now();
+                let result = crate::query::search(&mut self.cache, query, options, token(false)).and_then(|outcome| {
+                    let took = started.elapsed();
+                    let mut indices = outcome.nodes.context("search was superseded")?;
+                    if let Some(key) = sort {
+                        indices = self.sort(indices, key, descending, token(false)).context("sorting was superseded")?;
+                    } else if descending { indices.reverse(); }
+                    let total = indices.len();
+                    let offset = offset.min(total);
+                    let end = offset.saturating_add(limit).min(total);
+                    let rows = self.cache.expand_file_nodes(&indices[offset..end]);
+                    Ok(SearchPage { total, offset, took, loosened: outcome.loosened, rows })
+                });
+                let _ = reply.send(result);
+            }
             Cmd::Search {
                 query,
                 options,

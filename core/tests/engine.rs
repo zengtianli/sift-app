@@ -14,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+static ENGINE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn unique_dir(tag: &str) -> PathBuf {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -45,7 +46,38 @@ fn paths(engine: &Engine, query: &str) -> Vec<PathBuf> {
 }
 
 #[test]
+fn bounded_search_pages_survive_live_unrelated_writes() {
+    let _serial = ENGINE_TEST_LOCK.lock().unwrap();
+    sift_core::engine::QUIT.store(false, std::sync::atomic::Ordering::Relaxed);
+    let root = unique_dir("atomic-page");
+    let support = unique_dir("atomic-support");
+    for i in 0..50 { fs::write(root.join(format!("stable-{i:03}.txt")), "x").unwrap(); }
+    let config = Config { root: root.clone(), ignore_paths: vec![], include_paths: vec![], support_dir: support.clone() }.normalized();
+    config.save().unwrap();
+    let engine = Engine::start(config);
+    wait_until("page index ready", Duration::from_secs(30), || engine.status.state() == EngineState::Ready);
+    let churn = root.join("churn.txt");
+    let writer = std::thread::spawn(move || {
+        for i in 0..300 { fs::write(&churn, i.to_string()).unwrap(); std::thread::sleep(Duration::from_millis(10)); }
+    });
+    for _ in 0..150 {
+        let page = engine.search_page(None, Some("stable-".into()), true, Some(SortKey::Name), false, 7, 3).unwrap();
+        assert_eq!((page.total, page.offset, page.rows.len()), (50, 7, 3));
+        let actual: Vec<_> = page.rows.into_iter().map(|row| Row::from(row).path).collect();
+        assert_eq!(actual, (7..10).map(|i| root.join(format!("stable-{i:03}.txt"))).collect::<Vec<_>>());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(engine.search_page(None, Some("stable-".into()), true, None, false, 0, 4097).is_err());
+    writer.join().unwrap();
+    engine.shutdown();
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(support).unwrap();
+}
+
+#[test]
 fn engine_search_sort_live_update_socket_and_snapshot() {
+    let _serial = ENGINE_TEST_LOCK.lock().unwrap();
+    sift_core::engine::QUIT.store(false, std::sync::atomic::Ordering::Relaxed);
     let root = unique_dir("root");
     let support = unique_dir("support");
     fs::create_dir_all(root.join("docs/deep")).unwrap();

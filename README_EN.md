@@ -8,7 +8,7 @@ Search as you type, entering file names, paths and folder conditions in one sear
 
 ## Installation
 
-Requires an Apple Silicon Mac running macOS 14 or later. [Download the distribution ZIP](https://github.com/zengtianli/sift-app/releases/download/v0.2.2/Sift-0.2.2-arm64.zip); the public package is Developer ID signed, notarized and stapled. New packages and checksums are listed in [Releases](https://github.com/zengtianli/sift-app/releases).
+Requires an Apple Silicon Mac running macOS 14 or later. [Download the distribution ZIP](https://github.com/zengtianli/sift-app/releases/download/v0.2.3/Sift-0.2.3-arm64.zip); the public package is Developer ID signed, notarized and stapled. New packages and checksums are listed in [Releases](https://github.com/zengtianli/sift-app/releases).
 
 Extract the ZIP and move `Sift.app` to Applications. To search protected directories, personally grant Sift access in System Settings → Privacy & Security → Full Disk Access.
 

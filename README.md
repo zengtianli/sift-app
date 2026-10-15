@@ -4,11 +4,11 @@
 
 原生 macOS 文件名搜索工具，使用 AppKit 界面和基于 [Cardinal](https://github.com/cardisoft/cardinal) 的 Rust 索引内核。窗口与 `sift` 命令行共用索引、查询语法、排序和配置。
 
-输入即搜；文件名、路径和文件夹条件都在同一个搜索框内输入，支持大小写、名称、大小与日期筛选，以及键盘导航、Quick Look、在 Finder 中显示和移到废纸篓。索引根据文件系统事件增量更新；发生事件缺口时保留可用索引并显示重建状态。增量扫描使用专用后台线程，结果无可见变化时不重载列表；CLI 明确区分权限拒绝和 App 未运行。
+输入即搜；支持文件夹范围、大小写、名称、大小与日期筛选，以及键盘导航、Quick Look、在 Finder 中显示和移到废纸篓。索引根据文件系统事件增量更新；发生事件缺口时保留可用索引并显示重建状态。
 
 ## 安装
 
-需要 Apple Silicon Mac 和 macOS 14 或更新版本。[下载正式 ZIP](https://github.com/zengtianli/sift-app/releases/download/v0.2.3/Sift-0.2.3-arm64.zip)；正式包已使用 Developer ID 签名，并完成 Apple 公证和装订。新版与校验文件以 [Releases](https://github.com/zengtianli/sift-app/releases) 的实际附件为准。
+需要 Apple Silicon Mac 和 macOS 14 或更新版本。[下载正式 ZIP](https://github.com/zengtianli/sift-app/releases/download/v0.2.4/Sift-0.2.4-arm64.zip)；正式包已使用 Developer ID 签名，并完成 Apple 公证和装订。新版与校验文件以 [Releases](https://github.com/zengtianli/sift-app/releases) 的实际附件为准。
 
 下载 ZIP 后解压，将 `Sift.app` 放入「应用程序」。需要搜索受保护目录时，请本人在「系统设置 → 隐私与安全性 → 完全磁盘访问」中授权 Sift。
 

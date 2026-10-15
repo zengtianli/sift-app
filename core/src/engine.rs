@@ -639,7 +639,13 @@ fn walk_counting(config: &Config, progress: Option<&AtomicUsize>, stop: &AtomicB
             started.elapsed()
         );
     }
-    cache.filter(|_| !stop.load(Ordering::Relaxed) && !QUIT.load(Ordering::Relaxed))
+    let cache = cache.filter(|_| !stop.load(Ordering::Relaxed) && !QUIT.load(Ordering::Relaxed));
+    // The parallel walk's temporary Node tree has now been dropped, on success
+    // or cancellation. Each worker must drain its own remote-free queue before
+    // purging the unused pages; collecting only the index thread misses them.
+    rayon::broadcast(|_| crate::alloc::collect_unused());
+    crate::alloc::collect_unused();
+    cache
 }
 
 impl Loop {
@@ -852,6 +858,9 @@ impl Loop {
 
     fn accept_rebuilt_cache(&mut self, cache: SearchCache) {
         self.cache = cache;
+        // The previous index has just been dropped. Its freed small blocks must
+        // not remain charged to the resident app until the next full walk.
+        crate::alloc::collect_unused();
         self.status.dirty.store(true, Ordering::Relaxed);
         self.pending_rebuild_commit = self.status.rebuild_required.load(Ordering::Relaxed);
         self.history_done = false;
@@ -1001,6 +1010,9 @@ pub fn sort_indices(
             });
         }
         SortKey::Path => {
+            // Large path sorts materialise one temporary PathBuf per result.
+            // Declared before keyed so cancellation also drops all paths first.
+            let _collect = if indices.len() >= 8192 { Some(crate::alloc::CollectOnDrop) } else { None };
             let mut keyed = Vec::with_capacity(indices.len());
             for (i, index) in indices.iter().enumerate() {
                 token.is_cancelled_sparse(i)?;

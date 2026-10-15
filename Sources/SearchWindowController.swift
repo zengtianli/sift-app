@@ -85,7 +85,7 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
         window.title = "Sift"
         window.titlebarAppearsTransparent = true
         window.minSize = NSSize(width: 520, height: 280)
-        if !Prefs.readOnly { window.setFrameAutosaveName("SiftMain") }
+        if !Prefs.readOnly, !Prefs.headless { window.setFrameAutosaveName("SiftMain") }
         window.isReleasedWhenClosed = false
         window.tabbingMode = .disallowed
         super.init(window: window)
@@ -216,7 +216,7 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
             if id == "size" { column.headerCell.alignment = .right }
             table.addTableColumn(column)
         }
-        if !Prefs.readOnly {
+        if !Prefs.readOnly, !Prefs.headless {
             table.autosaveName = "SiftColumns"
             table.autosaveTableColumns = true
         }

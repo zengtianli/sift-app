@@ -269,6 +269,12 @@
       "repository": "https://github.com/rust-lang/libc"
     },
     {
+      "name": "libmimalloc-sys",
+      "version": "0.1.49",
+      "license": "MIT",
+      "repository": "https://github.com/purpleprotocol/mimalloc_rust/tree/master/libmimalloc-sys"
+    },
+    {
       "name": "lock_api",
       "version": "0.4.14",
       "license": "MIT OR Apache-2.0",
@@ -297,6 +303,12 @@
       "version": "0.9.11",
       "license": "MIT OR Apache-2.0",
       "repository": "https://github.com/RazrFalcon/memmap2-rs"
+    },
+    {
+      "name": "mimalloc",
+      "version": "0.1.52",
+      "license": "MIT",
+      "repository": "https://github.com/purpleprotocol/mimalloc_rust"
     },
     {
       "name": "namepool",
@@ -520,7 +532,7 @@
     },
     {
       "name": "sift-core",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "license": "MIT",
       "repository": null
     },

@@ -4,11 +4,11 @@
 
 A native macOS file-name search app with an AppKit interface and a Rust indexing engine based on [Cardinal](https://github.com/cardisoft/cardinal). The window and the `sift` CLI share the index, query syntax, sorting and configuration.
 
-Search as you type, entering file names, paths and folder conditions in one search field. Match case, filter names, sizes and dates, and navigate with the keyboard. Results support Quick Look, revealing in Finder and moving to Trash. File-system events update the index incrementally using a dedicated background thread, without reloading unchanged visible results. When events are lost, Sift keeps the usable index and shows the rebuild state. The CLI distinguishes access denial from an app that is not running.
+Search as you type, narrow searches to folders, match case, filter names, sizes and dates, and navigate with the keyboard. Results support Quick Look, revealing in Finder and moving to Trash. File-system events update the index incrementally. When events are lost, Sift keeps the usable index and shows the rebuild state.
 
 ## Installation
 
-Requires an Apple Silicon Mac running macOS 14 or later. [Download the distribution ZIP](https://github.com/zengtianli/sift-app/releases/download/v0.2.3/Sift-0.2.3-arm64.zip); the public package is Developer ID signed, notarized and stapled. New packages and checksums are listed in [Releases](https://github.com/zengtianli/sift-app/releases).
+Requires an Apple Silicon Mac running macOS 14 or later. [Download the distribution ZIP](https://github.com/zengtianli/sift-app/releases/download/v0.2.4/Sift-0.2.4-arm64.zip); the public package is Developer ID signed, notarized and stapled. New packages and checksums are listed in [Releases](https://github.com/zengtianli/sift-app/releases).
 
 Extract the ZIP and move `Sift.app` to Applications. To search protected directories, personally grant Sift access in System Settings → Privacy & Security → Full Disk Access.
 

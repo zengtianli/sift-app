@@ -14,12 +14,28 @@ pub const REPAIR_THREADS: usize = 2;
 const QOS_CLASS_BACKGROUND: u32 = 0x09;
 
 pub fn repair_pool() -> Option<rayon::ThreadPool> {
+    background_pool("sift-repair", REPAIR_THREADS)
+}
+
+fn background_pool(name: &'static str, threads: usize) -> Option<rayon::ThreadPool> {
     rayon::ThreadPoolBuilder::new()
-        .num_threads(REPAIR_THREADS)
-        .thread_name(|i| format!("sift-repair-{i}"))
+        .num_threads(threads)
+        .thread_name(move |i| format!("{name}-{i}"))
         .start_handler(|_| unsafe { let _ = pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0); })
         .build()
         .ok()
+}
+
+/// Incremental directory walks use the same `par_bridge` as a full walk. Installing
+/// these short, frequent jobs in the global pool wakes every search worker before
+/// they spin/park again. Keep their work on one persistent background worker;
+/// searches and initial walks retain the global pool, repairs retain their own two.
+pub fn incremental<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    match POOL.get_or_init(|| background_pool("sift-incremental", 1)) {
+        Some(pool) => pool.install(work),
+        None => work(), // Thread creation failure must not drop file events.
+    }
 }
 
 /// A repair waits while the whole Mac is at least this busy…
@@ -195,6 +211,21 @@ mod tests {
         assert_eq!(pool.current_num_threads(), REPAIR_THREADS);
         assert!(seen.iter().all(|(index, class)|
             index.is_some_and(|i| i < REPAIR_THREADS) && *class == QOS_CLASS_BACKGROUND), "{seen:?}");
+    }
+
+    #[test]
+    fn incremental_walk_keeps_results_and_does_not_wake_search_workers() {
+        use rayon::iter::{ParallelBridge, ParallelIterator};
+        let global_threads = rayon::current_num_threads();
+        let mut seen = incremental(|| (0..256).par_bridge().map(|value| {
+            let (mut class, mut relative) = (0u32, 0i32);
+            unsafe { pthread_get_qos_class_np(pthread_self(), &mut class, &mut relative) };
+            (value, std::thread::current().name().unwrap_or("").to_owned(), class)
+        }).collect::<Vec<_>>());
+        seen.sort_by_key(|row| row.0);
+        assert_eq!(seen.iter().map(|row| row.0).collect::<Vec<_>>(), (0..256).collect::<Vec<_>>());
+        assert!(seen.iter().all(|row| row.1 == "sift-incremental-0" && row.2 == QOS_CLASS_BACKGROUND));
+        assert_eq!(rayon::current_num_threads(), global_threads);
     }
     #[test]
     fn only_one_writer_can_hold_a_support_directory() {

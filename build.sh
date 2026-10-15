@@ -4,6 +4,7 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 CARGO="${CARGO:-$HOME/.cargo/bin/cargo}"
+export PATH="$(dirname "$CARGO"):$PATH"
 TARGET_DIR="${CARGO_TARGET_DIR:-$DIR/core/target}"
 # Keep machine paths and private build-directory names out of compiled binaries.
 export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=/build --remap-path-prefix=$DIR=."
@@ -18,6 +19,7 @@ APP="$STAGE/Sift.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin"
 cp Info.plist "$APP/Contents/Info.plist"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/"
+cp Resources/UI.zh-Hans.json "$APP/Contents/Resources/"
 SOURCES=()
 while IFS= read -r line; do SOURCES+=("$line"); done < <(find Sources -type f -name '*.swift' | LC_ALL=C sort)
 xcrun swiftc -swift-version 5 -O -whole-module-optimization -target arm64-apple-macos14.0 \

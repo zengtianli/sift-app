@@ -1,4 +1,5 @@
 import AppKit
+import SiftCore
 
 /// Sift's side of the shared「配置与更新」layer (Shared/AppLifecycle*.swift, byte copies of swift-shared). This is the
 /// one place that names the product, its release channel and its portable settings. The window
@@ -17,12 +18,20 @@ enum Lifecycle {
     /// already downloaded to this Mac; the app is built without a network client, see build.sh).
     /// Kept as a labelled argument with the channel as a literal: Chapter finds a product's private channel by
     /// that spelling in its sources (app_sop.private_update_channel) and compares the feed with the installed build.
+    #if !APP_STORE
     static let updateSource = release(updateSource: .privateCloud(channel: "default"))
     private static func release(updateSource: AppUpdateSource) -> AppUpdateSource { updateSource }
+    #endif
     /// What travels with「导出配置…」and the optional iCloud copy: the window's three preferences and the index
     /// settings in config.json. Recent searches, the window frame, the login item and Full Disk Access stay per Mac.
-    static let defaultsKeys = ["hotkey", "caseInsensitive", "showFolderScope"]
+    static let defaultsKeys = ["hotkey", "shortcuts.v1", "caseInsensitive", "showFolderScope", "sortKey", "sortDescending", "savedSearches", "appUpdateOptions"]
+    #if APP_STORE
+    /// The Mac App Store build keeps the index root per Mac: it is the folder granted on this Mac (IndexAccess), and
+    /// a root from an export or another Mac names a folder this Mac's sandbox was never given.
+    static let fileKeys = ["ignore_paths", "include_paths"]
+    #else
     static let fileKeys = ["root", "ignore_paths", "include_paths"]
+    #endif
 
     static let selfTestFlag = "--lifecycle-self-test"
     /// An isolated run is only accepted from a throwaway copy of the app whose bundle identifier starts with this:
@@ -54,8 +63,64 @@ enum Lifecycle {
 
     static func makeConfiguration(_ store: Store) -> AppConfiguration {
         AppConfiguration(productID: productID, defaultsKeys: defaultsKeys,
-                         files: [AppConfigurationFile(url: store.supportDirectory.appendingPathComponent("config.json"), keys: fileKeys)],
-                         defaults: store.defaults)
+                         files: [AppConfigurationFile(url: store.supportDirectory.appendingPathComponent("config.json"), keys: fileKeys, validateField:validateIndexField),
+                                 AppConfigurationFile(url: store.supportDirectory.appendingPathComponent("runtime.json"), keys: ["auto_repair", "auto_snapshot"], validateValue:validateBoolean)],
+                         defaults: store.defaults, validateDefault:validateDefault)
+    }
+
+    private static func invalid(_ message:String) -> Error { NSError(domain:"Sift.Configuration",code:2,userInfo:[NSLocalizedDescriptionKey:message + "；原配置已保留"]) }
+    private static func validateIndexField(_ key:String,_ value:Any) throws {
+        guard (key == "root" && value is String) || (key != "root" && value is [String]) else { throw invalid("索引根应为路径，排除和包含应为路径数组") }
+        try validatePath(value)
+    }
+    private static func validateBoolean(_ value:Any) throws {
+        guard let n = value as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() else { throw invalid("运行开关必须为 true 或 false") }
+    }
+    private static func validatePath(_ value:Any) throws {
+        let paths: [String]
+        if let s = value as? String { paths = [s] }
+        else if let list = value as? [String] { paths = list }
+        else { throw invalid("索引范围须为路径或路径数组") }
+        guard paths.allSatisfy({ !$0.contains("\0") && ($0 == "~" || $0.hasPrefix("/") || $0.hasPrefix("~/")) }) else { throw invalid("索引范围须为绝对路径或 ~/ 路径") }
+        if let root = value as? String {
+            let path = (root as NSString).expandingTildeInPath
+            var directory:ObjCBool = false
+            guard FileManager.default.fileExists(atPath:path,isDirectory:&directory),directory.boolValue,FileManager.default.isReadableFile(atPath:path) else { throw invalid("索引根目录不存在或不可读取") }
+        }
+    }
+    private static func validateDefault(_ key:String,_ value:Any) throws {
+        if ["caseInsensitive","showFolderScope","sortDescending"].contains(key) { try validateBoolean(value);return }
+        if key == "hotkey" {
+            guard let stored = value as? String,let combo = GlobalHotkey.Combo(stored:stored),combo.isUsable else { throw invalid("快捷键格式无效") };return
+        }
+        if key == "sortKey" {
+            guard let number = value as? NSNumber,(0...4).contains(number.intValue),number.doubleValue == Double(number.intValue) else { throw invalid("排序字段无效") };return
+        }
+        if key == "shortcuts.v1" {
+            guard let values = value as? [String:[String:String]] else { throw invalid("快捷键配置无效") }
+            for (id,binding) in values {
+                guard ShortcutAction.all.contains(where:{$0.id == id && id != "show"}),["app","global"].contains(binding["scope"] ?? ""),let stored = binding["stored"],stored.isEmpty || GlobalHotkey.Combo(stored:stored)?.isUsable == true else { throw invalid("快捷键配置含无效操作或组合") }
+                if let combo = GlobalHotkey.Combo(stored:stored),combo.modifiers == .command,[0,6,7,8,9].contains(combo.keyCode) { throw invalid("快捷键不可覆盖系统文本编辑键") }
+                if binding["scope"] == "app",let combo = GlobalHotkey.Combo(stored:stored),combo.modifiers == .command,SiftShortcuts.fixedAppKeyCodes.contains(combo.keyCode) { throw invalid("快捷键不可覆盖固定窗口导航") }
+            }
+            var seen = Set<String>()
+            for action in ShortcutAction.all where action.id != "show" {
+                let stored:String?
+                if let binding = values[action.id] { stored = binding["stored"].flatMap{$0.isEmpty ? nil : $0} }
+                else { stored = action.key.map{GlobalHotkey.Combo(keyCode:$0,modifiers:action.modifiers).stored} }
+                if let stored { guard seen.insert((values[action.id]?["scope"] ?? "app") + "/" + stored).inserted else { throw invalid("快捷键配置含重复绑定") } }
+            };return
+        }
+        if key == "savedSearches" {
+            guard let list = value as? [[String:String]],list.count <= 200,list.allSatisfy({ !($0["name"] ?? "").isEmpty && ($0["name"] ?? "").count <= 100 && !($0["query"] ?? "").isEmpty && ($0["query"] ?? "").count <= 4096 }) else { throw invalid("常用搜索格式无效") };return
+        }
+        #if !APP_STORE
+        if key == "appUpdateOptions" {
+            let data = try JSONSerialization.data(withJSONObject:value)
+            let options = try JSONDecoder().decode(AppUpdateOptions.self,from:data)
+            try AppUpdatePreferences.validate(options)
+        }
+        #endif
     }
 
     /// The portable values as they are stored right now (the export's own read), keyed as the export keys them:
@@ -73,6 +138,10 @@ enum Lifecycle {
         }
     }
 
+    // The command side and the updater are the Developer ID build's: the Mac App Store build has no `sift` CLI
+    // beside it and is updated by the App Store (Shared/AppLifecycle.swift, AppLifecycleCLI.swift and
+    // AppLifecycleUI.swift are not compiled into it, see store/project.yml).
+    #if !APP_STORE
     /// The .app this executable lives in, also when it was started through a symlink.
     static let hostBundle: Bundle = {
         guard let executable = Bundle.main.executableURL?.resolvingSymlinksInPath() else { return .main }
@@ -85,6 +154,12 @@ enum Lifecycle {
         product.bundle = hostBundle
         // `sift update install`: a running Sift saves its index when it quits, which can take a while on a big one.
         product.quitTimeout = 45
+        product.canInstallUpdate = {
+            guard let text = store.supportDirectory.path.withCString({ sift_remote_status($0) }) else { return false }
+            defer { sift_string_free(text) }
+            guard let status = (try? JSONSerialization.jsonObject(with:Data(String(cString:text).utf8))) as? [String:Any],status["ok"] as? Bool == true else { return false }
+            return status["running"] as? Bool == false || installable(status)
+        }
         return product
     }
 
@@ -136,4 +211,9 @@ enum Lifecycle {
     }
     private static func emit(_ text: String) { FileHandle.standardOutput.write(Data((text + "\n").utf8)) }
     private static func complain(_ message: String) { FileHandle.standardError.write(Data(("sift: " + message + "\n").utf8)) }
+    #endif
+    static func installable(_ status:[String:Any]) -> Bool {
+        let state = status["state"] as? String ?? ""
+        return ["ready","rebuild_required"].contains(state) && status["repairing"] as? Bool != true && (status["configuration_error"] as? String ?? "").isEmpty && (status["runtime_error"] as? String ?? "").isEmpty
+    }
 }

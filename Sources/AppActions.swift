@@ -19,25 +19,29 @@ enum HotkeySetting {
     /// The button Use ⇧⌘Space (as in Cardinal) and `sift hotkey set cardinal`.
     static let cardinal = GlobalHotkey.Combo(keyCode: UInt32(kVK_Space), modifiers: [.command, .shift])
     /// The orange note next to the recorder; `sift hotkey` reports it as in_use.
-    static let inUseNote = "In use by another app"
+    static let inUseNote = "新组合已被占用，原快捷键保留"
 
     struct State {
         let stored: GlobalHotkey.Combo?
         let registered: Bool
+        var rejected = false
         /// A combination is stored, but the system did not register it.
-        var inUse: Bool { stored != nil && !registered }
+        var inUse: Bool { rejected || (stored != nil && !registered) }
     }
 
     static func state(_ hotkey: GlobalHotkey) -> State {
-        State(stored: AppSettings.hotkey, registered: hotkey.combo != nil)
+        State(stored: AppSettings.hotkey, registered: hotkey.combo != nil, rejected: hotkey.rejected)
     }
 
     /// The recorder, Clear, the preset button, `sift hotkey set` and `sift hotkey clear`: the combination is stored
     /// (nil forgets it), then registered or unregistered. A refused registration leaves it stored, with the note.
     @discardableResult
     static func apply(_ combo: GlobalHotkey.Combo?, to hotkey: GlobalHotkey) -> State {
+        if let combo {
+            guard hotkey.register(combo) else { return state(hotkey) }
+        } else { hotkey.unregister() }
         AppSettings.hotkey = combo
-        if let combo { hotkey.register(combo) } else { hotkey.unregister() }
+        ShortcutCatalog.write()
         return state(hotkey)
     }
 }
@@ -100,6 +104,8 @@ enum AppActions {
               let action = request["action"] as? String else { return line(failure("usage", "the request names no action")) }
         switch action {
         case "trash": return line(trash(request))
+        case "shortcuts", "shortcut_set", "shortcut_clear", "saved", "saved_add", "saved_remove", "file_info", "file_rename":
+            return line(onMain(seconds: 20) { features(action, request) })
         case "hotkey", "hotkey_set", "hotkey_clear", "login_item", "login_item_set":
             return line(onMain(seconds: 20) { system(action, request) })
         default: return line(failure("usage", "unknown action \(action)"))
@@ -107,6 +113,46 @@ enum AppActions {
     }
 
     // MARK: Move to Trash
+
+    private static func features(_ action: String, _ request: [String: Any]) -> [String: Any] {
+        guard !Prefs.headless else { return failure("unavailable", "headless 实例不更改窗口设置或本人文件") }
+        do {
+            switch action {
+            case "shortcuts": return ["ok":true,"shortcuts":SiftShortcuts.shared.list()]
+            case "shortcut_set":
+                guard let id = request["id"] as? String, let stored = request["stored"] as? String,
+                      let combo = GlobalHotkey.Combo(stored:stored) else { return failure("usage","需要操作和有效组合键") }
+                if let error = SiftShortcuts.shared.set(id, combo:combo, scope:request["scope"] as? String ?? "app") { return failure("invalid_shortcut",error) }
+                settings()?.showSystemSettings()
+                return ["ok":true,"shortcuts":SiftShortcuts.shared.list()]
+            case "shortcut_clear":
+                guard let id = request["id"] as? String else { return failure("usage","需要操作 id") }
+                if id == "all" { SiftShortcuts.shared.clearAll() }
+                else if id == "defaults" { SiftShortcuts.shared.reset() }
+                else if let error = SiftShortcuts.shared.set(id, combo:nil, scope:"app") { return failure("usage",error) }
+                settings()?.showSystemSettings()
+                return ["ok":true,"shortcuts":SiftShortcuts.shared.list()]
+            case "saved": return ["ok":true,"searches":SavedSearches.items]
+            case "saved_add":
+                try SavedSearches.add(name:request["name"] as? String ?? "",query:request["query"] as? String ?? "",folder:request["dir"] as? String ?? "",caseInsensitive:request["case_insensitive"] as? Bool ?? true)
+                settings()?.showSystemSettings()
+                return ["ok":true,"searches":SavedSearches.items]
+            case "saved_remove":
+                SavedSearches.remove(request["name"] as? String ?? "")
+                settings()?.showSystemSettings()
+                return ["ok":true,"searches":SavedSearches.items]
+            case "file_info": return try ProductFiles.info(request["path"] as? String ?? "")
+            case "file_rename":
+                guard request["confirmed"] as? Bool == true else { return failure("confirmation_required","重命名需要 --yes") }
+                let path = request["path"] as? String ?? ""
+                guard path.hasPrefix("/") else { return failure("usage","请提供绝对路径") }
+                let target = try ProductFiles.rename(path,to:request["name"] as? String ?? "")
+                search?.resultsMayHaveChanged()
+                return ["ok":true,"path":target.path]
+            default: return failure("usage","未知操作")
+            }
+        } catch { return failure("failed",error.localizedDescription) }
+    }
 
     private static func trash(_ request: [String: Any]) -> [String: Any] {
         guard request["confirmed"] as? Bool == true else {

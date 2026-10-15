@@ -169,7 +169,9 @@ fn handle(req: Request, service: &Service) -> Result<Value> {
     let engine = &service.engine;
     match req.op.as_str() {
         "status" => Ok(service.status_json()),
+        "control" => service.control(&req.action.unwrap_or_else(|| json!({"action":"status"}))),
         "rescan" => {
+            if engine.status.paused.load(Ordering::Relaxed) { bail!("索引已暂停，请先运行 sift index resume"); }
             // Callers wait for `walks` to pass this value (a manual walk resets `rescans`).
             let walks = engine.status.walks.load(Ordering::Relaxed);
             engine.rescan();
@@ -201,15 +203,15 @@ fn search(req: Request, engine: &Engine, out: &mut impl Write) -> Result<()> {
         None => None,
         Some(s) => Some(SortKey::parse(s).with_context(|| format!("unknown sort key {s:?}"))?),
     };
-    let Some((outcome, took)) = engine.search(req.dir, req.query, req.case_insensitive, false)? else {
+    let Some((outcome, took, revision)) = engine.search_versioned(req.dir, req.query, req.case_insensitive, false)? else {
         bail!("search was superseded by a newer one");
     };
     let case_insensitive = req.case_insensitive;
     let mut indices = outcome.nodes.unwrap_or_default();
     if let Some(key) = sort {
         indices = engine
-            .sort(indices, key, req.desc, false)
-            .context("sort was superseded by a newer search")?;
+            .sort_at(indices, key, req.desc, false, Some(revision))
+            .context("index changed during sorting; retry the search")?;
     } else if req.desc {
         indices.reverse();
     }
@@ -223,14 +225,22 @@ fn search(req: Request, engine: &Engine, out: &mut impl Write) -> Result<()> {
     let s = &engine.status;
     write!(
         out,
-        r#"{{"ok":true,"live":true,"total":{total},"offset":{start},"search_ms":{search_ms:.3},"case_insensitive":{case_insensitive},"state":"{}","rebuild_required":{},"repairing":{},"results":["#,
+        r#"{{"live":true,"total":{total},"offset":{start},"search_ms":{search_ms:.3},"case_insensitive":{case_insensitive},"state":"{}","rebuild_required":{},"repairing":{}"#,
         s.state().as_str(),
         s.rebuild_required.load(Ordering::Relaxed),
         s.repairing.load(Ordering::Relaxed),
     )?;
+    if let Some(loosened) = outcome.loosened {
+        out.write_all(b",\"loosened\":")?;
+        serde_json::to_writer(&mut *out, &loosened)?;
+    }
+    out.write_all(b",\"results\":[")?;
     let mut first = true;
+    let mut changed = false;
     for chunk in indices[start..end].chunks(ROW_CHUNK) {
-        for node in engine.nodes(chunk.to_vec()) {
+        let rows = engine.nodes_at(chunk.to_vec(), Some(revision));
+        if rows.len() != chunk.len() { changed = true; break; }
+        for node in rows {
             if !first {
                 out.write_all(b",")?;
             }
@@ -239,7 +249,8 @@ fn search(req: Request, engine: &Engine, out: &mut impl Write) -> Result<()> {
         }
         out.flush()?;
     }
-    out.write_all(b"]}\n")?;
+    if changed { out.write_all(b"],\"ok\":false,\"error\":\"index changed while reading results; retry the search\",\"retryable\":true}\n")?; }
+    else { out.write_all(b"],\"ok\":true}\n")?; }
     out.flush()?;
     Ok(())
 }
@@ -262,11 +273,31 @@ impl std::fmt::Display for TimedOut {
 
 impl std::error::Error for TimedOut {}
 
+/// Access was denied, so the client cannot infer whether an app is listening.
+#[derive(Debug)]
+pub struct SocketBlocked {
+    path: PathBuf,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for SocketBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "access to Sift socket {} was blocked: {}; retry outside the guard: ~/Dev/tools/dev/lib/tools/cc/guarded-bin/outside-guard -- sift …", self.path.display(), self.source)
+    }
+}
+
+impl std::error::Error for SocketBlocked {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.source) }
+}
+
 /// Like `request`, but gives up after `timeout` (then the error is `TimedOut`).
 pub fn request_within(socket: &Path, req: &Request, timeout: Option<Duration>) -> Result<Option<Value>> {
     let mut stream = match UnixStream::connect(socket) {
         Ok(s) => s,
-        Err(_) => return Ok(None),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied || matches!(e.raw_os_error(), Some(1 | 13)) =>
+            return Err(SocketBlocked { path: socket.to_owned(), source: e }.into()),
+        Err(e) => return Err(e).with_context(|| format!("connect to {}", socket.display())),
     };
     stream.set_read_timeout(timeout)?;
     serde_json::to_writer(&mut stream, req)?;

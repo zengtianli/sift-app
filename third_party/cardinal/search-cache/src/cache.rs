@@ -747,7 +747,8 @@ impl SearchCache {
     // - Procedure contains metadata fetching, if metadata fetching failed, None is returned.
     fn scan_path_recursive(&mut self, path: &Path) -> Option<SlabIndex> {
         // Ensure path is under the watch root
-        if path.symlink_metadata().err().map(|e| e.kind()) == Some(ErrorKind::NotFound) {
+        let metadata = path.symlink_metadata();
+        if metadata.as_ref().err().map(|e| e.kind()) == Some(ErrorKind::NotFound) {
             self.remove_node_path(path);
             return None;
         };
@@ -765,6 +766,18 @@ impl SearchCache {
             .iter()
             .find(|&&x| path.file_name() == Some(OsStr::new(self.file_nodes[x].name())))
         {
+            // A content/metadata update at an existing leaf changes neither its
+            // name nor its parent. Rebuilding the node needlessly removes and
+            // reinserts its sorted name-index entry, reconstructing many paths.
+            // Keep the identity and refresh all metadata. Directories and any
+            // former subtree still take the full walk (including type changes).
+            if let Ok(metadata) = &metadata {
+                if !metadata.is_dir() && self.file_nodes[old_node].children.is_empty() {
+                    self.file_nodes[old_node].metadata =
+                        SlabNodeMetadataCompact::some(NodeMetadata::from(metadata.clone()));
+                    return Some(old_node);
+                }
+            }
             self.remove_node(old_node);
         }
         // For incremental data, we need metadata
@@ -2651,6 +2664,31 @@ mod tests {
                 .node_index_for_path(&root.join("new_dir/file.txt"))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn leaf_updates_preserve_identity_metadata_and_type_transitions() {
+        let temp = TempDir::new("leaf_update").unwrap();
+        let path = temp.path().join("leaf.txt");
+        fs::write(&path, b"old").unwrap();
+        let mut cache = SearchCache::walk_fs(temp.path());
+        let first = cache.node_index_for_path(&path).unwrap();
+        fs::write(&path, vec![0u8; 8192]).unwrap();
+        assert_eq!(cache.scan_path_recursive(&path), Some(first));
+        assert_eq!(cache.node_metadata(first).unwrap().as_ref().unwrap().size(), 8192);
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let child = path.join("child.txt");
+        fs::write(&child, b"child").unwrap();
+        cache.scan_path_recursive(&path);
+        assert!(cache.node_index_for_path(&child).is_some());
+        fs::remove_dir_all(&path).unwrap();
+        fs::write(&path, b"x").unwrap();
+        let leaf = cache.scan_path_recursive(&path).unwrap();
+        assert!(cache.node_index_for_path(&child).is_none());
+        assert!(cache.file_nodes[leaf].children.is_empty());
+        assert_eq!(cache.node_metadata(leaf).unwrap().as_ref().unwrap().size(), 1);
     }
 
     #[test]

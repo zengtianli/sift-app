@@ -6,12 +6,13 @@
 //! immediately instead of running.
 
 use crate::config::Config;
+use crate::query::SearchOutcome;
 use crate::recovery::{BackgroundPriority, HostLoad, RecoverySchedule, repair_pool, writer_lock};
 use anyhow::Result;
 use cardinal_sdk::{EventFlag, EventWatcher, FsEvent};
 use crossbeam_channel::{Receiver, Sender, bounded, never, select, tick, unbounded};
 use search_cache::{
-    SearchCache, SearchOptions, SearchOutcome, SearchQuery, SearchResultNode, SlabIndex,
+    SearchCache, SearchOptions, SearchQuery, SearchResultNode, SlabIndex,
     SlabNodeMetadataCompact, WalkData,
 };
 use search_cancel::CancellationToken;
@@ -25,6 +26,18 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{info, warn};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimePolicy {
+    pub paused: bool,
+    pub auto_repair: bool,
+    pub auto_snapshot: bool,
+}
+impl Default for RuntimePolicy {
+    fn default() -> Self { Self { paused: false, auto_repair: true, auto_snapshot: true } }
+}
 
 /// Set when the process is quitting; the walker and loaders poll it.
 pub static QUIT: AtomicBool = AtomicBool::new(false);
@@ -101,6 +114,13 @@ pub struct Status {
     pub walks: AtomicU64,
     /// Unix seconds when the last full walk finished (0 = none in this process).
     pub last_walk: AtomicU64,
+    pub paused: AtomicBool,
+    pub auto_repair: AtomicBool,
+    pub auto_snapshot: AtomicBool,
+    pub scan_stop: AtomicBool,
+    pub index_revision: AtomicU64,
+    pub configuration_error: Mutex<String>,
+    pub runtime_error: Mutex<String>,
 }
 
 impl Status {
@@ -158,14 +178,17 @@ enum Cmd {
         options: SearchOptions,
         token: CancellationToken,
         /// The outcome and the time the search itself took (not time spent queued).
-        reply: Sender<Result<(SearchOutcome, Duration)>>,
+        reply: Sender<Result<(SearchOutcome, Duration, u64)>>,
     },
     Nodes {
         indices: Vec<SlabIndex>,
+        revision: Option<u64>,
         reply: Sender<Vec<SearchResultNode>>,
     },
+    Locate { indices: Vec<SlabIndex>, paths: Vec<PathBuf>, revision: u64, reply: Sender<Vec<usize>> },
     Sort {
         indices: Vec<SlabIndex>,
+        revision: Option<u64>,
         key: SortKey,
         descending: bool,
         token: CancellationToken,
@@ -173,6 +196,7 @@ enum Cmd {
     },
     Rescan,
     Reconfigure(Config),
+    PolicyChanged(bool),
     Flush {
         reply: Sender<Result<bool>>,
     },
@@ -189,6 +213,7 @@ pub struct Engine {
     /// settings back when that change's walk did not complete, so status never
     /// reports settings the index is not built with.
     settings: Arc<Mutex<Config>>,
+    policy: Mutex<RuntimePolicy>,
     thread: Mutex<Option<JoinHandle<()>>>,
     _writer_lock: Option<std::fs::File>,
 }
@@ -202,6 +227,23 @@ impl Engine {
         let lock = writer_lock(&config)?;
         let (tx, rx) = unbounded();
         let status = Arc::new(Status::default());
+        let policy = match std::fs::read(config.support_dir.join("runtime.json")) {
+            Ok(bytes) => match serde_json::from_slice::<RuntimePolicy>(&bytes) {
+                Ok(policy) => policy,
+                Err(error) => {
+                    *status.runtime_error.lock().unwrap() = format!("索引运行选项损坏，已暂停；请在设置中确认运行选项：{error}");
+                    RuntimePolicy { paused:true, auto_repair:false, auto_snapshot:false }
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => RuntimePolicy::default(),
+            Err(error) => {
+                *status.runtime_error.lock().unwrap() = format!("无法读取索引运行选项，已暂停：{error}");
+                RuntimePolicy { paused:true, auto_repair:false, auto_snapshot:false }
+            }
+        };
+        status.paused.store(policy.paused, Ordering::Relaxed);
+        status.auto_repair.store(policy.auto_repair, Ordering::Relaxed);
+        status.auto_snapshot.store(policy.auto_snapshot, Ordering::Relaxed);
         let thread_status = status.clone();
         let settings = Arc::new(Mutex::new(config.clone()));
         let thread_settings = settings.clone();
@@ -213,6 +255,7 @@ impl Engine {
             tx,
             status,
             settings,
+            policy: Mutex::new(policy),
             thread: Mutex::new(Some(thread)),
             _writer_lock: lock,
         }))
@@ -228,6 +271,12 @@ impl Engine {
         case_insensitive: bool,
         interactive: bool,
     ) -> Result<Option<(SearchOutcome, Duration)>> {
+        Ok(self.search_versioned(directory, query, case_insensitive, interactive)?.map(|(o,t,_)| (o,t)))
+    }
+
+    pub fn search_versioned(
+        &self, directory: Option<String>, query: Option<String>, case_insensitive: bool, interactive: bool,
+    ) -> Result<Option<(SearchOutcome, Duration, u64)>> {
         let token = token(interactive);
         let (reply, rx) = bounded(1);
         self.send(Cmd::Search {
@@ -239,18 +288,27 @@ impl Engine {
             token,
             reply,
         })?;
-        let (outcome, took) = rx.recv()??;
-        Ok(outcome.nodes.is_some().then_some((outcome, took)))
+        let (outcome, took, revision) = rx.recv()??;
+        Ok(outcome.nodes.is_some().then_some((outcome, took, revision)))
     }
 
     pub fn nodes(&self, indices: Vec<SlabIndex>) -> Vec<SearchResultNode> {
+        self.nodes_at(indices, None)
+    }
+
+    pub fn nodes_at(&self, indices: Vec<SlabIndex>, revision: Option<u64>) -> Vec<SearchResultNode> {
         if indices.is_empty() {
             return Vec::new();
         }
         let (reply, rx) = bounded(1);
-        if self.send(Cmd::Nodes { indices, reply }).is_err() {
+        if self.send(Cmd::Nodes { indices, revision, reply }).is_err() {
             return Vec::new();
         }
+        rx.recv().unwrap_or_default()
+    }
+    pub fn locate(&self, indices: Vec<SlabIndex>, paths: Vec<PathBuf>, revision: u64) -> Vec<usize> {
+        let (reply, rx) = bounded(1);
+        if self.send(Cmd::Locate { indices, paths, revision, reply }).is_err() { return vec![]; }
         rx.recv().unwrap_or_default()
     }
 
@@ -262,10 +320,15 @@ impl Engine {
         descending: bool,
         interactive: bool,
     ) -> Option<Vec<SlabIndex>> {
+        self.sort_at(indices, key, descending, interactive, None)
+    }
+
+    pub fn sort_at(&self, indices: Vec<SlabIndex>, key: SortKey, descending: bool, interactive: bool, revision: Option<u64>) -> Option<Vec<SlabIndex>> {
         let token = token(interactive);
         let (reply, rx) = bounded(1);
         self.send(Cmd::Sort {
             indices,
+            revision,
             key,
             descending,
             token,
@@ -276,7 +339,38 @@ impl Engine {
     }
 
     pub fn rescan(&self) {
+        self.status.scan_stop.store(false, Ordering::Relaxed);
         let _ = self.send(Cmd::Rescan);
+    }
+
+    pub fn policy(&self) -> RuntimePolicy { self.policy.lock().unwrap().clone() }
+
+    pub fn set_policy(&self, policy: RuntimePolicy) -> Result<()> {
+        self.edit_policy(|p| *p = policy)
+    }
+
+    pub fn edit_policy(&self, edit: impl FnOnce(&mut RuntimePolicy)) -> Result<()> {
+        let mut saved = self.policy.lock().unwrap();
+        let mut policy = saved.clone();edit(&mut policy);
+        let directory = self.settings.lock().unwrap().support_dir.clone();
+        std::fs::create_dir_all(&directory)?;
+        let temporary = directory.join("runtime.json.tmp");
+        std::fs::write(&temporary, serde_json::to_vec_pretty(&policy)?)?;
+        std::fs::rename(temporary, directory.join("runtime.json"))?;
+        self.status.runtime_error.lock().unwrap().clear();
+        // Resume only on the index thread, after its paused watcher is replaced:
+        // otherwise a new batch could advance the watermark past changes skipped while paused.
+        if policy.paused { self.status.paused.store(true, Ordering::Relaxed); }
+        self.status.auto_repair.store(policy.auto_repair, Ordering::Relaxed);
+        self.status.auto_snapshot.store(policy.auto_snapshot, Ordering::Relaxed);
+        if policy.paused { self.status.scan_stop.store(true, Ordering::Relaxed); }
+        let paused = policy.paused;*saved = policy;
+        self.send(Cmd::PolicyChanged(paused))
+    }
+
+    pub fn cancel_scan(&self) {
+        self.status.scan_stop.store(true, Ordering::Relaxed);
+        let _ = self.send(Cmd::PolicyChanged(self.policy().paused));
     }
 
     /// The settings in effect (see the field). Hold the lock across a check-and-change.
@@ -452,7 +546,7 @@ fn load_or_walk(config: &Config, status: &Status) -> SearchCache {
         }
         Err(e) => {
             info!("no usable snapshot ({e:#}); walking {:?}", config.root);
-            let cache = walk(config, status).unwrap_or_else(|| {
+            let cache = if status.paused.load(Ordering::Relaxed) { None } else { walk(config, status) }.unwrap_or_else(|| {
                 SearchCache::noop(
                     config.root.clone(),
                     config.ignore_paths.clone(),
@@ -469,7 +563,7 @@ fn load_or_walk(config: &Config, status: &Status) -> SearchCache {
 
 fn walk(config: &Config, status: &Status) -> Option<SearchCache> {
     status.set_state(EngineState::Scanning);
-    let cache = walk_counting(config, Some(&status.files), &AtomicBool::new(false));
+    let cache = walk_counting(config, Some(&status.files), &status.scan_stop);
     if cache.is_some() {
         status.record_walk();
     }
@@ -513,7 +607,7 @@ fn walk_counting(config: &Config, progress: Option<&AtomicUsize>, stop: &AtomicB
             started.elapsed()
         );
     }
-    cache
+    cache.filter(|_| !stop.load(Ordering::Relaxed) && !QUIT.load(Ordering::Relaxed))
 }
 
 impl Loop {
@@ -537,6 +631,11 @@ impl Loop {
 
     fn start_watcher(&mut self) {
         self.history_done = false;
+        if self.status.paused.load(Ordering::Relaxed) {
+            self.watcher = EventWatcher::noop();
+            self.set_active_state(EngineState::Ready);
+            return;
+        }
         if self.cache.is_noop() {
             self.watcher = EventWatcher::noop();
             self.set_active_state(EngineState::Ready);
@@ -564,25 +663,54 @@ impl Loop {
             } => {
                 self.last_activity = Instant::now();
                 let started = Instant::now();
-                let outcome = self
-                    .cache
-                    .search_query_with_options(query, options, token);
-                let _ = reply.send(outcome.map(|o| (o, started.elapsed())));
+                let outcome = crate::query::search(&mut self.cache, query, options, token);
+                let revision = self.status.index_revision.load(Ordering::Relaxed);
+                let _ = reply.send(outcome.map(|o| (o, started.elapsed(), revision)));
             }
-            Cmd::Nodes { indices, reply } => {
-                let _ = reply.send(self.cache.expand_file_nodes(&indices));
+            Cmd::Nodes { indices, revision, reply } => {
+                let current = self.status.index_revision.load(Ordering::Relaxed);
+                let rows = if revision.is_none_or(|r| r == current) { self.cache.expand_file_nodes(&indices) } else { vec![] };
+                let _ = reply.send(rows);
+            }
+            Cmd::Locate { indices, paths, revision, reply } => {
+                if self.status.index_revision.load(Ordering::Relaxed) != revision { let _ = reply.send(vec![]); return None; }
+                let names: std::collections::HashSet<_> = paths.iter().filter_map(|p| p.file_name().and_then(|n| n.to_str())).collect();
+                let wanted: std::collections::HashSet<_> = paths.iter().collect();
+                let found = indices.iter().enumerate().filter_map(|(position,index)| {
+                    if !self.cache.node_name(*index).is_some_and(|n| names.contains(n)) { return None; }
+                    self.cache.node_path(*index).filter(|p| wanted.contains(p)).map(|_| position)
+                }).collect();
+                let _ = reply.send(found);
             }
             Cmd::Sort {
                 indices,
+                revision,
                 key,
                 descending,
                 token,
                 reply,
             } => {
                 self.last_activity = Instant::now();
-                let _ = reply.send(self.sort(indices, key, descending, token));
+                let current = self.status.index_revision.load(Ordering::Relaxed);
+                let sorted = if revision.is_none_or(|r| r == current) { self.sort(indices, key, descending, token) } else { None };
+                let _ = reply.send(sorted);
             }
             Cmd::Rescan => { self.rescan(); }
+            Cmd::PolicyChanged(paused) => {
+                let was_paused = self.status.paused.load(Ordering::Relaxed);
+                let canceled = self.status.scan_stop.load(Ordering::Relaxed);
+                if self.status.scan_stop.load(Ordering::Relaxed) { self.cancel_repair(); }
+                if !self.status.auto_repair.load(Ordering::Relaxed) { self.cancel_repair(); }
+                if paused {
+                    self.watcher = EventWatcher::noop();
+                    self.set_active_state(EngineState::Ready);
+                } else {
+                    self.status.paused.store(false, Ordering::Relaxed);
+                    self.status.scan_stop.store(false, Ordering::Relaxed);
+                    if self.cache.is_noop() && self.status.configuration_error.lock().unwrap().is_empty() { self.rescan(); }
+                    else if was_paused || canceled { self.start_watcher(); }
+                }
+            }
             Cmd::Reconfigure(config) => {
                 if config != self.config {
                     self.watcher = EventWatcher::noop();
@@ -594,6 +722,9 @@ impl Loop {
                         let mut settings = self.settings.lock().unwrap();
                         if *settings == failed {
                             *settings = self.config.clone();
+                            if let Err(e) = self.config.save() {
+                                *self.status.configuration_error.lock().unwrap() = format!("扫描未完成，原范围已恢复，但配置回滚写入失败：{e:#}");
+                            }
                         }
                         drop(settings);
                         self.start_watcher();
@@ -609,6 +740,7 @@ impl Loop {
     }
 
     fn apply_events(&mut self, events: Vec<FsEvent>) {
+        if self.status.paused.load(Ordering::Relaxed) { return; }
         self.status
             .events
             .fetch_add(events.len(), Ordering::Relaxed);
@@ -632,7 +764,8 @@ impl Loop {
             let _ = self.cache.handle_fs_events(rebuild);
             self.require_rebuild();
         }
-        if self.cache.handle_fs_events(incremental).is_err() {
+        let cache = &mut self.cache;
+        if crate::recovery::incremental(|| cache.handle_fs_events(incremental)).is_err() {
             self.pending_rebuild_commit = false;
             self.require_rebuild();
         }
@@ -647,9 +780,11 @@ impl Loop {
         self.status
             .rescans
             .store(self.cache.rescan_count(), Ordering::Relaxed);
+        self.status.index_revision.fetch_add(1, Ordering::Relaxed);
     }
 
     fn rescan(&mut self) -> bool {
+        if self.status.paused.load(Ordering::Relaxed) { return false; }
         self.cancel_repair();
         self.recovery.attempted(Instant::now());
         self.pending_rebuild_commit = false;
@@ -659,6 +794,7 @@ impl Loop {
             self.start_watcher();
             true
         } else {
+            self.status.files.store(self.cache.get_total_files(), Ordering::Relaxed);
             self.require_rebuild();
             if !QUIT.load(Ordering::Relaxed) { self.start_watcher(); }
             false
@@ -670,6 +806,7 @@ impl Loop {
         self.status.dirty.store(true, Ordering::Relaxed);
         self.pending_rebuild_commit = self.status.rebuild_required.load(Ordering::Relaxed);
         self.history_done = false;
+        self.status.index_revision.fetch_add(1, Ordering::Relaxed);
     }
 
     fn commit_rebuilt_cache(&mut self) {
@@ -702,6 +839,7 @@ impl Loop {
     fn maybe_recover(&mut self) {
         let host_busy = self.host.sample();
         if QUIT.load(Ordering::Relaxed) || std::env::var_os("SIFT_READONLY").is_some()
+            || self.status.paused.load(Ordering::Relaxed) || !self.status.auto_repair.load(Ordering::Relaxed)
             || self.pending_rebuild_commit || self.repair.is_some() { return; }
         if self.recovery.due(Instant::now(), self.status.rebuild_required.load(Ordering::Relaxed),
                              self.last_activity.elapsed(), host_busy) {
@@ -734,6 +872,7 @@ impl Loop {
     }
 
     fn maybe_idle_flush(&mut self) {
+        if !self.status.auto_snapshot.load(Ordering::Relaxed) { return; }
         if self.last_activity.elapsed() < FLUSH_IDLE {
             return;
         }

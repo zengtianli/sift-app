@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
 };
@@ -40,13 +41,14 @@ impl Config {
     pub fn default_support_dir() -> PathBuf {
         match std::env::var_os("SIFT_SUPPORT_DIR") {
             Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-            _ => home().join("Library/Application Support/cyou.tianli.sift"),
+            // `$HOME` itself, not `home()`: in the sandboxed app this is the container, where its files belong.
+            _ => home_from(None, std::env::var_os("HOME")).join("Library/Application Support/cyou.tianli.sift"),
         }
     }
 
     pub fn default_in(support_dir: &Path) -> Self {
         Self {
-            root: PathBuf::from("/"),
+            root: default_root(std::env::var_os("SIFT_DEFAULT_ROOT")),
             ignore_paths: DEFAULT_IGNORE_PATHS.iter().map(PathBuf::from).collect(),
             include_paths: Vec::new(),
             support_dir: support_dir.to_path_buf(),
@@ -62,7 +64,7 @@ impl Config {
                 let mut config: Config = serde_json::from_slice(&bytes)
                     .with_context(|| format!("invalid {}", path.display()))?;
                 config.support_dir = support_dir.to_path_buf();
-                Ok(config.normalized())
+                config.validated()
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Ok(Self::default_in(support_dir))
@@ -77,7 +79,45 @@ impl Config {
         let tmp = path.with_extension("json.tmp");
         fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
         fs::rename(&tmp, &path)?;
+        // Keep only an independently valid configuration for a damaged-file startup.
+        // A backup failure does not turn an already committed save into a failed transaction.
+        if self.clone().validated().is_ok() {
+            let backup = self.support_dir.join("config-last-good.json");
+            let temporary = backup.with_extension("json.tmp");
+            if fs::write(&temporary, serde_json::to_vec_pretty(self)?).is_ok() {
+                let _ = fs::rename(temporary, backup);
+            }
+        }
         Ok(())
+    }
+
+    /// Validate before normalization: never silently broaden a malformed root or drop a line.
+    pub fn validated(self) -> Result<Self> {
+        for path in std::iter::once(&self.root).chain(&self.ignore_paths).chain(&self.include_paths) {
+            if expand(path).is_none() {
+                bail!("路径 {} 必须是绝对路径或 ~/ 开头；原配置未修改", path.display());
+            }
+        }
+        let normalized = self.normalized();
+        if !normalized.root.is_dir() {
+            bail!("索引根目录 {} 不存在或不是文件夹；原配置未修改", normalized.root.display());
+        }
+        fs::read_dir(&normalized.root).with_context(|| format!("无法读取索引根目录 {}", normalized.root.display()))?;
+        Ok(normalized)
+    }
+
+    /// On a bad primary file restore its last valid scope, or an empty private scope.
+    /// The damaged file stays untouched for diagnosis and an explicit Settings save.
+    pub fn recover(support_dir: &Path) -> Self {
+        if let Ok(bytes) = fs::read(support_dir.join("config-last-good.json")) {
+            if let Ok(mut config) = serde_json::from_slice::<Self>(&bytes) {
+                config.support_dir = support_dir.to_path_buf();
+                if let Ok(config) = config.validated() { return config; }
+            }
+        }
+        let empty = support_dir.join("configuration-needs-repair");
+        let _ = fs::create_dir_all(&empty);
+        Self { root: empty, ignore_paths: vec![], include_paths: vec![], support_dir: support_dir.to_path_buf() }.normalized()
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -184,14 +224,37 @@ impl ConfigEdit {
     }
 }
 
-fn home() -> PathBuf {
-    std::env::var_os("HOME")
+/// The user's home folder, for `~` in settings and pasted paths. `$HOME` everywhere
+/// except in the sandboxed (Mac App Store) app: there `$HOME` is the app's container,
+/// so the app names the real home in `SIFT_USER_HOME` before it starts the engine
+/// (Sources/StoreAccess.swift). Otherwise `~/Library/Caches` on the ignore list would
+/// name a folder inside the container and the real one would be indexed.
+pub(crate) fn home() -> PathBuf {
+    home_from(std::env::var_os("SIFT_USER_HOME"), std::env::var_os("HOME"))
+}
+
+fn home_from(user_home: Option<OsString>, home: Option<OsString>) -> PathBuf {
+    user_home
+        .filter(|h| Path::new(h).is_absolute())
+        .or(home)
         .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// The index root of the default settings: the whole disk, unless the app names
+/// another folder in `SIFT_DEFAULT_ROOT`. The sandboxed app does (the folder the user
+/// granted, or an empty one while nothing is granted): it cannot read `/` on its own,
+/// and a first start without `config.json` must not walk what it was never given.
+fn default_root(named: Option<OsString>) -> PathBuf {
+    named
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 fn expand(path: &Path) -> Option<PathBuf> {
     let s = path.to_str()?.trim();
+    if s.contains('\0') { return None; }
     let expanded = if s == "~" {
         home()
     } else if let Some(rest) = s.strip_prefix("~/") {
@@ -219,6 +282,21 @@ mod tests {
             c.ignore_paths,
             vec![home().join("x"), PathBuf::from("/Volumes"), PathBuf::from(SYSTEM_IGNORE_PATH)]
         );
+    }
+
+    #[test]
+    fn sandboxed_app_names_the_real_home_and_its_default_root() {
+        let container = Some(OsString::from("/Users/me/Library/Containers/cyou.tianli.sift/Data"));
+        // Outside the sandbox nothing is named: `$HOME` and the whole disk, as before.
+        assert_eq!(home_from(None, Some("/Users/me".into())), PathBuf::from("/Users/me"));
+        assert_eq!(default_root(None), PathBuf::from("/"));
+        // In the sandbox `$HOME` is the container; the named home wins.
+        assert_eq!(home_from(Some("/Users/me".into()), container.clone()), PathBuf::from("/Users/me"));
+        assert_eq!(default_root(Some("/Users/me/Documents".into())), PathBuf::from("/Users/me/Documents"));
+        // A value that is not an absolute path is not taken.
+        assert_eq!(home_from(Some("".into()), container.clone()), PathBuf::from(container.unwrap()));
+        assert_eq!(default_root(Some("relative".into())), PathBuf::from("/"));
+        assert_eq!(home_from(None, None), PathBuf::from("/"));
     }
 
     #[test]

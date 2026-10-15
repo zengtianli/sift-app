@@ -1,0 +1,9 @@
+{
+  "copy": {
+    "search.placeholder": "搜索文件名或路径",
+    "search.folder": "在匹配的文件夹中…",
+    "menu.settings": "设置…",
+    "menu.history": "最近搜索",
+    "menu.reindex": "重建索引"
+  }
+}

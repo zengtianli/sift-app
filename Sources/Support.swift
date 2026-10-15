@@ -89,7 +89,12 @@ enum Prefs {
     /// `--lifecycle-self-test`: this process as the running app for the real `sift config …` commands, on a throwaway
     /// copy of the bundle with its own index, folders and preference domain (LifecycleSelfTest). It writes there, so
     /// it is neither read-only nor headless; nothing of it reaches the screen, the Dock or a system-wide key.
+    #if APP_STORE
+    /// The Mac App Store build has no `sift` CLI for that self-test to drive (LifecycleSelfTest.swift is not in it).
+    static let lifecycleSelfTest = false
+    #else
     static let lifecycleSelfTest = CommandLine.arguments.contains(Lifecycle.selfTestFlag)
+    #endif
 
     /// In verification runs, file actions (open, reveal, trash, pasteboard) are
     /// only logged so they can never reach other apps or the user's screen.
@@ -108,12 +113,14 @@ enum Prefs {
     static func set(_ value: Any?, forKey key: String) {
         guard !readOnly, !headless else { return }
         UserDefaults.standard.set(value, forKey: key)
+        UserDefaults.standard.synchronize()
         didWrite?(key, value)
     }
 
     static func remove(_ key: String) {
         guard !readOnly, !headless else { return }
         UserDefaults.standard.removeObject(forKey: key)
+        UserDefaults.standard.synchronize()
         didWrite?(key, nil)
     }
 }
@@ -144,6 +151,9 @@ final class SearchHistory {
     }
 }
 
+// The Mac App Store build asks for a folder instead (IndexAccess, StoreAccess.swift): Full Disk Access does not
+// lift the App Sandbox.
+#if !APP_STORE
 enum Permissions {
     /// Full Disk Access is required to index Mail, Messages, Safari data and
     /// other protected folders. Probed by reading a TCC-protected file, in the
@@ -156,3 +166,4 @@ enum Permissions {
         }
     }
 }
+#endif

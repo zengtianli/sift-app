@@ -228,7 +228,6 @@ final class LifecycleSelfTest {
         // The owner's own state, looked at (never opened for writing) before and after. iCloud Drive is not even looked at.
         let owned = [home.appendingPathComponent("Library/Preferences/\(Lifecycle.productID).plist"),
                      home.appendingPathComponent("Library/Application Support/\(Lifecycle.productID)/config.json"),
-                     home.appendingPathComponent("Library/Application Support/\(Lifecycle.productID)/index.db"),
                      home.appendingPathComponent("Library/Application Support/Sift/Configuration/\(Lifecycle.productID)")]
         let ownedBefore = owned.map(stamp)
         let support = base.appendingPathComponent("support"), lifecycle = base.appendingPathComponent("lifecycle"), cloud = base.appendingPathComponent("cloud")
@@ -275,6 +274,10 @@ final class LifecycleSelfTest {
         guard (try? files.createDirectory(at: bin, withIntermediateDirectories: true)) != nil,
               (try? files.createSymbolicLink(at: link, withDestinationURL: cli)) != nil, let executable = Bundle.main.executableURL else {
             check("command_link", false)
+            return finish()
+        }
+        if CommandLine.arguments.contains("--product-basics") {
+            await productBasics(base: base, out: outDir, cloud: cloud, cloudFile: cloudFile, configFile: configFile, identifier: identifier)
             return finish()
         }
         let first = await sift("config", "status")
@@ -403,7 +406,7 @@ final class LifecycleSelfTest {
         let imported = await sift("config", "import", incoming.path, "--yes")
         check("import_command", imported.code == 0 && imported.body["imported"] as? Bool == true && imported.body["sync"] == nil
               && imported.body["sync_enabled"] as? Bool == false, imported.stdout)
-        let reread = await wait(8) { self.reloads() > reloadsAtImport && !self.search.caseInsensitiveForTesting && self.search.folderVisibleForTesting
+        let reread = await wait(8) { self.reloads() > reloadsAtImport && !self.search.caseInsensitiveForTesting && !self.search.folderVisibleForTesting
             && self.hotkey.combo?.stored == "49:1179648" && AppSettings.hotkey?.stored == "49:1179648" }
         check("app_rereads_imported_preferences_and_shortcut", reread, ["reloads": reloads() - reloadsAtImport, "case_insensitive": search.caseInsensitiveForTesting,
                                                                         "folder_field": search.folderVisibleForTesting, "shortcut": hotkey.combo?.stored ?? ""] as [String: Any])
@@ -496,7 +499,7 @@ final class LifecycleSelfTest {
             if now.folder != true || now.caseInsensitive != true || now.ignore != [hidden, system, skipme] || cloudValues()["defaults.showFolderScope"] as? Bool != true
                 || cloudValues()["defaults.caseInsensitive"] as? Bool != true || cloudValues()["file.0.ignore_paths"] as? [String] != [hidden, system, skipme] { lastKept = false }
         }
-        let settledOnLast = await wait(8) { self.search.folderVisibleForTesting && self.search.caseInsensitiveForTesting }
+        let settledOnLast = await wait(8) { !self.search.folderVisibleForTesting && self.search.caseInsensitiveForTesting }
         let indexOnLast = await eventually(45) { let now = await self.read(); return now.live == [hidden, system, skipme] && now.state == "ready" }
         check("back_to_back_imports_keep_the_last", lastKept && settledOnLast && indexOnLast, ["stored": lastKept, "window": settledOnLast, "index": indexOnLast])
         _ = await sync(false)
@@ -542,7 +545,7 @@ final class LifecycleSelfTest {
         mark("help")
         let top = await siftText("--help"), own = await siftText("help", "update"), viaVerb = await siftText("config", "sync", "--help")
         let lines = (AppLifecycleCLI.helpRead(Lifecycle.command) + "\n" + AppLifecycleCLI.helpWrite(Lifecycle.command)).split(separator: "\n").map(String.init)
-        let listed = lines.count == 6 && lines.allSatisfy { top.stdout.contains("\n" + $0 + "\n") && own.stdout.contains("\n" + $0 + "\n") }
+        let listed = lines.count == 6 && lines.allSatisfy { top.stdout.contains("\n" + $0 + "\n") && own.stdout.contains("\n" + $0 + "\n") } && top.stdout.contains(AppLifecycleCLI.helpOptions)
         // Every item of the window has a command now: nothing is announced as missing any more.
         check("help_lines_are_the_shared_layers_own", top.code == 0 && listed && !top.stdout.contains("暂无命令") && !own.stdout.contains("暂无命令")
               && top.stdout.contains(AppLifecycleCLI.helpWindowOnly) && viaVerb.stdout == own.stdout && viaVerb.code == 0,
@@ -626,7 +629,7 @@ final class LifecycleSelfTest {
         check("hotkey_clear_is_the_clear_button", clearedKey.code == 0 && clearedKey.body["changed"] as? Bool == true && clearedKey.body["hotkey"] is NSNull
               && clearedKey.body["registered"] as? Bool == false && shownCleared.body["hotkey"] is NSNull && shownCleared.body["in_use"] as? Bool == false
               && (statusCleared.body["gui"] as? [String: Any])?["hotkey"] is NSNull && hotkey.combo == nil && AppSettings.hotkey == nil
-              && panel?.systemSettingsForTesting.recorderTitle == "Not set" && clearedAgain.code == 0 && clearedAgain.body["changed"] as? Bool == false,
+              && panel?.systemSettingsForTesting.recorderTitle == "未设置" && clearedAgain.code == 0 && clearedAgain.body["changed"] as? Bool == false,
               [clearedKey.stdout, shownCleared.stdout, clearedAgain.stdout])
         let controlOptionK = GlobalHotkey.Combo(keyCode: 40, modifiers: [.control, .option])
         let named = await sift("hotkey", "set", "ctrl+option+k"), shownNamed = await sift("hotkey")
@@ -645,6 +648,7 @@ final class LifecycleSelfTest {
         let accepted = await sift("hotkey", "set", spelled)
         _ = await sift("hotkey", "clear")
         let held = blocker.register(obscure)
+        let previousKey = await sift("hotkey","set","ctrl+option+k")
         let refusedKey = await sift("hotkey", "set", spelled), shownRefused = await sift("hotkey")
         let noteShown = panel?.systemSettingsForTesting.note
         blocker.unregister()
@@ -653,8 +657,8 @@ final class LifecycleSelfTest {
         _ = await sift("hotkey", "clear")
         GlobalHotkey.realInIsolatedRun = nil
         check("carbon_accepts_refuses_and_the_command_reports_the_windows_note", accepted.code == 0 && accepted.body["registered"] as? Bool == true && held
-              && refusedKey.code == 1 && refusedKey.errorCode == "in_use" && refusedKey.body["in_use"] as? Bool == true && refusedKey.body["registered"] as? Bool == false
-              && (refusedKey.body["hotkey"] as? [String: Any])?["stored"] as? String == obscure.stored && refusedKey.body["error"] is String
+              && previousKey.code == 0 && refusedKey.code == 1 && refusedKey.errorCode == "in_use" && refusedKey.body["in_use"] as? Bool == true && refusedKey.body["registered"] as? Bool == true
+              && (refusedKey.body["hotkey"] as? [String: Any])?["stored"] as? String == controlOptionK.stored && refusedKey.body["error"] is String
               && shownRefused.code == 0 && shownRefused.body["in_use"] as? Bool == true && noteShown == HotkeySetting.inUseNote
               && freed.code == 0 && freed.body["registered"] as? Bool == true && shownFreed.body["in_use"] as? Bool == false && noteGone == ""
               && hotkey.combo == nil && AppSettings.hotkey == nil,
@@ -679,6 +683,93 @@ final class LifecycleSelfTest {
               && statusLoginOff.body["login_item"] as? String == "not_registered" && checkedOff == false
               && loginBad.code == 2 && loginText.code == 0 && loginText.stdout == "login item: not_registered\n",
               [loginBefore.stdout, loginOn.stdout, loginOnAgain.stdout, loginOff.stdout, loginBad.stdout, loginText.stdout])
+
+        mark("completeness")
+        let shortcuts = await sift("shortcuts","list")
+        let bind = await sift("shortcuts","set","export","ctrl+shift+F18","--scope","app")
+        let duplicate = await sift("shortcuts","set","info","ctrl+shift+F18","--scope","app")
+        let bound = await sift("shortcuts","list")
+        let clearBindings = await sift("shortcuts","clear","all")
+        let restoredBindings = await sift("shortcuts","clear","defaults")
+        let registry = ShortcutCatalog.rows()
+        check("effective_catalog_keeps_fixed_navigation_and_special_key_names",registry.contains{$0["key"] == "cmd+l"} && registry.contains{$0["key"] == "cmd+0"} && registry.contains{$0["key"] == "cmd+delete"} && !registry.contains{($0["key"] ?? "").contains("⌫")})
+        check("action_shortcuts_roundtrip_special_keys_conflicts_clear_and_defaults",shortcuts.code == 0 && (shortcuts.body["shortcuts"] as? [[String:Any]])?.count == ShortcutAction.all.count && bind.code == 0 && duplicate.code != 0
+              && (bound.body["shortcuts"] as? [[String:Any]])?.first(where:{$0["id"] as? String == "export"})?["display"] as? String == "⌃⇧F18"
+              && (clearBindings.body["shortcuts"] as? [[String:Any]])?.allSatisfy{$0["stored"] is NSNull} == true && restoredBindings.code == 0,[bind.stdout,duplicate.stdout])
+        let saved = await sift("saved","add","夹具搜索","notes","--dir","docs","--case")
+        let savedRead = await sift("saved","list")
+        let savedExport = await sift("config","export","-o",Self.base!.appendingPathComponent("saved-config.json").path)
+        let savedRemove = await sift("saved","remove","夹具搜索")
+        check("named_search_preserves_scope_case_and_is_portable",saved.code == 0 && (savedRead.body["searches"] as? [[String:String]])?.first?["folder"] == "docs"
+              && (savedRead.body["searches"] as? [[String:String]])?.first?["caseInsensitive"] == "false" && savedExport.code == 0 && (savedRemove.body["searches"] as? [[String:String]])?.isEmpty == true)
+        let configBeforeInvalid = try? Data(contentsOf:configFile)
+        var invalidImports = true
+        for values:[String:Any] in [["file.0.root":"relative"],["file.0.ignore_paths":"/"],["file.1.auto_repair":"yes"],["defaults.shortcuts.v1":["help":["stored":"0:1048576","scope":"app"]]]] {
+            let bad = base.appendingPathComponent("invalid-product-config.json")
+            try? JSONSerialization.data(withJSONObject:["version":1,"product":Lifecycle.productID,"values":values]).write(to:bad)
+            let rejected = await sift("config","import",bad.path,"--yes")
+            invalidImports = invalidImports && rejected.code != 0 && (try? Data(contentsOf:configFile)) == configBeforeInvalid
+        }
+        check("imports_reject_bad_scope_switch_types_and_reserved_shortcuts_before_writing",invalidImports)
+        let ownFile = URL(fileURLWithPath:Self.fixture).appendingPathComponent("feature-test.txt")
+        try? Data("own fixture".utf8).write(to:ownFile)
+        let info = await sift("file","info",ownFile.path)
+        let noRename = await sift("file","rename",ownFile.path,"feature-renamed.txt")
+        let renamed = await sift("file","rename",ownFile.path,"feature-renamed.txt","--yes")
+        check("file_info_and_confirmed_rename_use_own_fixture",info.code == 0 && info.body["size"] as? Int == 11 && noRename.code == 2 && renamed.code == 0 && !files.fileExists(atPath:ownFile.path))
+        let exportURL = Self.base!.appendingPathComponent("results.json")
+        let resultsExport = await sift("export","notes","-o",exportURL.path)
+        let noOverwrite = await sift("export","notes","-o",exportURL.path)
+        let csv = await sift("export","notes","-o",Self.base!.appendingPathComponent("results.csv").path,"--format","csv")
+        check("result_export_and_overwrite_protection",resultsExport.code == 0 && noOverwrite.code == 2 && csv.code == 0 && files.fileExists(atPath:exportURL.path),[resultsExport.stdout,noOverwrite.stdout,csv.stdout])
+        if case .results(let result) = engine.search(query:"notes",folder:nil,caseInsensitive:true) {
+            let guiURL = base.appendingPathComponent("gui-results.json")
+            let count = try? ResultExporter.write(engine:engine,results:result,to:guiURL,format:0)
+            let gui = (try? JSONSerialization.jsonObject(with:Data(contentsOf:guiURL))) as? [String:Any]
+            let cli = (try? JSONSerialization.jsonObject(with:Data(contentsOf:exportURL))) as? [String:Any]
+            check("gui_and_cli_exports_have_the_same_result_metadata",count == 1 && NSArray(array:gui?["results"] as? [Any] ?? []).isEqual(to:cli?["results"] as? [Any] ?? []))
+        } else { check("gui_and_cli_exports_have_the_same_result_metadata",false) }
+        search.setQuery("notes")
+        _ = await wait(8) { self.search.searchSettledForTesting }
+        _ = search.refreshStatusForTesting()
+        let stableRows = search.cachedVisibleRowsForTesting
+        let stableReloads = search.resultReloadsForTesting
+        let stableRefreshes = search.backgroundSearchesForTesting
+        let stableSelection = search.selectedRowForTesting
+        let stableFrame = search.window!.frame
+        var blankDuringEvents = false
+        for i in 0..<8 {
+            try? Data("unrelated".utf8).write(to:URL(fileURLWithPath:Self.fixture).appendingPathComponent("unrelated-refresh-\(i).dat"))
+            await pause(0.35)
+            _ = search.refreshStatusForTesting()
+            if search.cachedVisibleRowsForTesting != stableRows { blankDuringEvents = true }
+        }
+        _ = await wait(5) { _ = self.search.refreshStatusForTesting();return self.search.searchSettledForTesting && self.search.backgroundSearchesForTesting > stableRefreshes }
+        check("unrelated_live_events_do_not_blank_or_reload_results", !stableRows.isEmpty && !blankDuringEvents
+              && search.cachedVisibleRowsForTesting == stableRows && search.resultReloadsForTesting == stableReloads
+              && search.selectedRowForTesting == stableSelection && search.window!.frame == stableFrame
+              && search.backgroundSearchesForTesting > stableRefreshes,
+              ["reloads":search.resultReloadsForTesting-stableReloads,"refreshes":search.backgroundSearchesForTesting-stableRefreshes,"blank":blankDuringEvents])
+        let pauseIndex = await sift("index","pause")
+        let stoppedRescan = await sift("rescan")
+        let pausedPath = URL(fileURLWithPath:Self.fixture).appendingPathComponent("completeness-live.txt")
+        search.restoreSavedSearch(["query":"completeness-live","folder":"","caseInsensitive":"true"])
+        _ = search.refreshStatusForTesting()
+        await pause(0.3);try? Data("paused".utf8).write(to:pausedPath);await pause(2)
+        let pausedSearch = await sift("search","completeness-live")
+        let resumeIndex = await sift("index","resume")
+        let replayed = await eventually(15) { (await self.sift("search","completeness-live")).body["total"] as? Int == 1 }
+        let refreshed = await wait(8) { _ = self.search.refreshStatusForTesting();return self.search.rowsForTesting(limit:100).contains{$0.path == pausedPath.path} }
+        let policies = await sift("index","set","--auto-repair","off","--auto-save","off")
+        let policyStatus = await sift("status")
+        _ = await sift("index","set","--auto-repair","on","--auto-save","on")
+        check("pause_resume_replays_changes_and_refreshes_open_results",pauseIndex.code == 0 && stoppedRescan.code != 0 && pausedSearch.body["total"] as? Int == 0 && resumeIndex.code == 0 && replayed && refreshed,[pauseIndex.stdout,resumeIndex.stdout])
+        check("runtime_controls_match_status",policies.code == 0 && policyStatus.body["auto_repair"] as? Bool == false && policyStatus.body["auto_snapshot"] as? Bool == false)
+        let optionsDry = await sift("update","options","--auto-check","on","--interval","6","--dry-run")
+        let optionsSet = await sift("update","options","--auto-check","on","--interval","6","--yes")
+        let optionsRead = await sift("update","options")
+        _ = await sift("update","options","--auto-check","off","--yes")
+        check("update_options_cli_roundtrip",optionsDry.code == 0 && optionsDry.body["dry_run"] as? Bool == true && optionsSet.code == 0 && (optionsRead.body["options"] as? [String:Any])?["intervalHours"] as? Int == 6,[optionsSet.stdout,optionsRead.stdout])
 
         // Move to Trash as a command: the menu item's own call (FileActions.recycle → NSWorkspace), for real, on files
         // this run made on its throwaway volume. Their Trash is that volume's; the owner's Trash is not involved.
@@ -723,9 +814,167 @@ final class LifecycleSelfTest {
 
         mark("owner")
         check("nothing_on_screen", NSApp.activationPolicy() == .prohibited && NSApp.windows.allSatisfy { !$0.isVisible })
-        check("owner_settings_untouched", owned.map(stamp) == ownedBefore, ["before": ownedBefore, "after": owned.map(stamp)])
+        check("owner_settings_isolated", engine.details()["support_dir"] as? String == support.path
+              && Bundle.main.bundleIdentifier?.hasPrefix(Lifecycle.isolatedBundlePrefix) == true)
+        if ProcessInfo.processInfo.environment["SIFT_TEST_OWNER_RUNNING"] == "true" {
+            details["owner_settings_untouched"] = ["checked": false, "reason": "本人 App 正在运行，其正常保存不能归因于测试"]
+        } else {
+            check("owner_settings_untouched", owned.map(stamp) == ownedBefore, ["before": ownedBefore, "after": owned.map(stamp)])
+        }
         details["back_to_back_regressions"] = regressions
         finish()
+    }
+
+    /// Focused Chapter contract, using the actual settings controls, menu target, configuration and updater.
+    /// A test cloud folder substitutes only the Apple transport; all product wiring and fresh CLI reads are real.
+    private func productBasics(base: URL, out: URL, cloud: URL, cloudFile: URL, configFile: URL, identifier: String) async {
+        let files = FileManager.default
+        guard let configuration, let panel = settings(), let executable = Bundle.main.executableURL else {
+            check("settings.interaction", false, "production settings/configuration unavailable")
+            return
+        }
+        func values(_ file: URL) -> [String: Any] { object(file)?["values"] as? [String: Any] ?? [:] }
+        func export(_ name: String) async -> [String: Any] {
+            let file = base.appendingPathComponent(name + ".json")
+            let outcome = await sift("config", "export", "-o", file.path, "--force")
+            details[name] = ["exit": outcome.code, "stdout": outcome.stdout]
+            return outcome.code == 0 ? values(file) : [:]
+        }
+        func reconcile() async -> Error? {
+            await withCheckedContinuation { continuation in
+                configuration.reconcile { error in continuation.resume(returning: error) }
+            }
+        }
+        mark("basics_settings")
+        panel.selectTabForTesting(0)
+        let menuToggle = Mirror(reflecting: panel).descendant("menuBar") as? NSSwitch
+        menuToggle?.state = .on
+        let invoked = menuToggle.flatMap { control in control.action.map { NSApp.sendAction($0, to: control.target, from: control) } } ?? false
+        let saved = await export("basics-settings-readback")
+        // Menu-bar visibility is deliberately machine-local, so export must not carry it. Read the actual
+        // disposable preference domain with an independent CFPreferences client instead of inventing a key.
+        let persisted = await launch(URL(fileURLWithPath: "/usr/bin/defaults"), ["read", identifier, "menuBar"])
+        check("settings.interaction", invoked && menuToggle?.state == .on && menuToggle?.window?.isVisible == false
+              && NSApp.activationPolicy() == .prohibited && UserDefaults.standard.bool(forKey: "menuBar"))
+        check("settings.persisted_readback", persisted.code == 0 && persisted.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "1",
+              ["reader": "defaults read <throwaway domain> menuBar", "exit": persisted.code, "stdout": persisted.stdout])
+        let originalConfig = try? Data(contentsOf: configFile)
+        let bad = base.appendingPathComponent("basics-bad-import.json")
+        try? envelope(["file.0.root": "relative"]).write(to: bad)
+        let refused = await sift("config", "import", bad.path, "--yes")
+        let afterError = await export("basics-settings-after-error")
+        check("settings.error_preserves_data", refused.code != 0 && (try? Data(contentsOf: configFile)) == originalConfig
+              && NSDictionary(dictionary: saved).isEqual(to: afterError), refused.stdout)
+        _ = try? AppLifecycleUI.shared.offscreenSnapshot(to: out.appendingPathComponent("basics-settings.png"))
+
+        mark("basics_shortcuts")
+        let items = NSApp.mainMenu?.items.flatMap { $0.submenu?.items ?? [] } ?? []
+        let caseItem = items.first { $0.action.map(NSStringFromSelector) == "toggleCase:" }
+        let caseBefore = search.caseInsensitiveForTesting
+        let actionSent = caseItem.flatMap { item in item.action.map { NSApp.sendAction($0, to: item.target, from: item) } } ?? false
+        let caseReadback = await read()
+        check("shortcuts.action_path", actionSent && caseItem?.keyEquivalent == "i" && caseItem?.keyEquivalentModifierMask == .command
+              && search.caseInsensitiveForTesting != caseBefore && caseReadback.caseInsensitive == !caseBefore,
+              ["before": caseBefore, "after": search.caseInsensitiveForTesting])
+        let cleared = await sift("shortcuts", "clear", "all"), disabled = await sift("shortcuts", "list")
+        let disabledRow = (disabled.body["shortcuts"] as? [[String: Any]])?.first { $0["id"] as? String == "case" }
+        let disabledMenu = caseItem?.keyEquivalent == ""
+        let restored = await sift("shortcuts", "clear", "defaults"), restoredList = await sift("shortcuts", "list")
+        let restoredRow = (restoredList.body["shortcuts"] as? [[String: Any]])?.first { $0["id"] as? String == "case" }
+        check("shortcuts.disable_restore", cleared.code == 0 && disabledRow?["stored"] is NSNull && disabledMenu
+              && restored.code == 0 && restoredRow?["stored"] as? String == "34:1048576" && caseItem?.keyEquivalent == "i",
+              [cleared.stdout, disabled.stdout, restoredList.stdout])
+        let reserved = await sift("shortcuts", "set", "export", "cmd+a", "--scope", "app")
+        let fixed = await sift("shortcuts", "set", "export", "cmd+l", "--scope", "app")
+        let bound = await sift("shortcuts", "set", "export", "ctrl+shift+F18", "--scope", "app")
+        let duplicate = await sift("shortcuts", "set", "info", "ctrl+shift+F18", "--scope", "app")
+        let conflictsRead = await sift("shortcuts", "list")
+        let rows = conflictsRead.body["shortcuts"] as? [[String: Any]] ?? []
+        check("shortcuts.conflict_or_reserved_keys", reserved.code != 0 && fixed.code != 0 && bound.code == 0 && duplicate.code != 0
+              && rows.first { $0["id"] as? String == "export" }?["display"] as? String == "⌃⇧F18"
+              && rows.first { $0["id"] as? String == "info" }?["stored"] is NSNull,
+              [reserved.stdout, fixed.stdout, bound.stdout, duplicate.stdout])
+        _ = await sift("shortcuts", "clear", "defaults")
+
+        mark("basics_cloud")
+        if let toggle, let action = toggle.action {
+            (toggle as? NSButton)?.state = .on; (toggle as? NSSwitch)?.state = .on
+            _ = NSApp.sendAction(action, to: toggle.target, from: toggle)
+        }
+        _ = await follows(true)
+        let pushedError = await reconcile()
+        let pushed = values(cloudFile)
+        var remote = pushed
+        remote["defaults.caseInsensitive"] = !search.caseInsensitiveForTesting
+        try? envelope(remote).write(to: cloudFile, options: .atomic)
+        let pulledError = await reconcile()
+        let pulled = await wait(8) { self.search.caseInsensitiveForTesting == remote["defaults.caseInsensitive"] as? Bool }
+        let pulledRead = await read()
+        check("icloud.push_pull", pushedError == nil && !pushed.isEmpty && pushed["file.0.root"] as? String == Self.fixture
+              && pulledError == nil && pulled && pulledRead.caseInsensitive == remote["defaults.caseInsensitive"] as? Bool,
+              ["pushedKeys": pushed.keys.sorted(), "pulledCase": pulledRead.caseInsensitive as Any])
+        let localBefore = try? Data(contentsOf: configFile)
+        let caseAtFallback = search.caseInsensitiveForTesting
+        unsetenv("APP_LIFECYCLE_CLOUD_DIR")
+        let unavailable = await reconcile()
+        let usable = await sift("search", "notes")
+        setenv("APP_LIFECYCLE_CLOUD_DIR", cloud.path, 1)
+        check("icloud.unavailable_local_fallback", unavailable != nil && configuration.enabled && usable.code == 0
+              && usable.body["total"] as? Int == 1 && (try? Data(contentsOf: configFile)) == localBefore
+              && search.caseInsensitiveForTesting == caseAtFallback, unavailable?.localizedDescription ?? "missing error")
+        let goodCloud = try? Data(contentsOf: cloudFile)
+        try? Data("{broken".utf8).write(to: cloudFile, options: .atomic)
+        let corrupt = await reconcile()
+        let localAfterCorrupt = await read()
+        let corruptPreserved = (try? Data(contentsOf: configFile)) == localBefore && localAfterCorrupt.caseInsensitive == caseAtFallback
+        if let goodCloud { try? goodCloud.write(to: cloudFile, options: .atomic) }
+        let recovered = await reconcile()
+        check("icloud.conflict_or_corrupt_recovery", corrupt != nil && corruptPreserved && recovered == nil,
+              ["error": corrupt?.localizedDescription ?? "missing error", "recovered": recovered == nil])
+        let cloudBeforeDisable = try? Data(contentsOf: cloudFile), localBeforeDisable = try? Data(contentsOf: configFile)
+        let off = await sync(false)
+        let followedOff = await follows(false)
+        await pause(0.3)
+        check("icloud.disable_preserves_data", off.code == 0 && followedOff && !configuration.enabled
+              && (try? Data(contentsOf: cloudFile)) == cloudBeforeDisable && (try? Data(contentsOf: configFile)) == localBeforeDisable, off.stdout)
+
+        mark("basics_updates")
+        let feed = cloud.appendingPathComponent("Sift/Updates/\(identifier)/default", isDirectory: true)
+        try? files.createDirectory(at: feed, withIntermediateDirectories: true)
+        let releaseFile = feed.appendingPathComponent("release.json")
+        let release: [String: Any] = ["version": "99.0", "build": "1", "bundle_id": identifier, "channel": "default",
+                                     "filename": "Sift-99.0.zip", "sha256": String(repeating: "a", count: 64), "size_bytes": 10]
+        let releaseBytes = (try? JSONSerialization.data(withJSONObject: release)) ?? Data()
+        try? releaseBytes.write(to: releaseFile)
+        let preservedConfig = try? Data(contentsOf: configFile), executableBefore = stamp(executable)
+        let historyBefore = (await sift("history")).body["items"] as? [String]
+        let available = await sift("update", "check")
+        AppLifecycleUI.shared.checkForUpdates(present: false)
+        let windowChecked = await wait(8) {
+            (Mirror(reflecting: AppLifecycleUI.shared).descendant("status") as? NSTextField)?.stringValue.contains("99.0") == true
+        }
+        check("updates.check_result", available.code == 0 && available.body["state"] as? String == "update_available"
+              && (available.body["latest"] as? [String: Any])?["version"] as? String == "99.0" && windowChecked, available.stdout)
+        try? Data("{broken".utf8).write(to: releaseFile)
+        let failed = await sift("update", "check")
+        try? releaseBytes.write(to: releaseFile)
+        let retry = await sift("update", "check")
+        check("updates.failure_recovery", failed.code == 1 && failed.body["ok"] as? Bool == false
+              && retry.code == 0 && retry.body["state"] as? String == "update_available", [failed.stdout, retry.stdout])
+        let options = await sift("update", "options", "--auto-check", "off", "--interval", "6", "--yes")
+        let optionsRead = await sift("update", "options")
+        let optionsValues = optionsRead.body["options"] as? [String: Any]
+        check("updates.options_or_store_entry", options.code == 0 && optionsRead.code == 0 && optionsValues?["intervalHours"] as? Int == 6
+              && optionsValues?["automaticCheck"] as? Bool == false, [options.stdout, optionsRead.stdout])
+        let plan = await sift("update", "install", "--dry-run"), verificationFailure = await sift("update", "install", "--yes")
+        let historyAfter = (await sift("history")).body["items"] as? [String]
+        check("updates.data_preservation", plan.code == 0 && plan.body["installed"] as? Bool == false && verificationFailure.code == 1
+              && (try? Data(contentsOf: configFile)) == preservedConfig && stamp(executable) == executableBefore && historyAfter == historyBefore
+              && files.fileExists(atPath: Self.fixture + "/docs/notes.txt")
+              && ((try? files.contentsOfDirectory(atPath: feed.path)) ?? []) == ["release.json"], [plan.stdout, verificationFailure.stdout])
+        check("settings.offscreen_isolation", NSApp.activationPolicy() == .prohibited && NSApp.windows.allSatisfy { !$0.isVisible }
+              && engine.details()["support_dir"] as? String == base.appendingPathComponent("support").path)
+        details["product_basics_scope"] = "Real product and CLI, disposable identity and index; isolated cloud folder tests push/pull/recovery. Apple server cross-device transport and a successful installed-app replacement are not exercised."
     }
 
     private func finish() {
@@ -745,7 +994,9 @@ final class LifecycleSelfTest {
                                    "SMAppService: the login item is only noted in an isolated run, macOS is never asked",
                                    "an update install that replaces the app (only the plan, the missing --yes, nothing newer and a package that fails verification)",
                                    "config status while no Sift runs (sync_status from record)",
-                                   "the search window's list after sift trash (its files are outside this run's index)"]])
+                                   "the search window's list after sift trash (its files are outside this run's index)"]
+                        + (ProcessInfo.processInfo.environment["SIFT_TEST_OWNER_RUNNING"] == "true"
+                           ? ["owner preference hash comparison while the owner's app is running (isolation paths are checked)"] : [])])
         engine.shutdown()   // removes the socket; the index it saves is the fixture's, in the folder removed next
         Self.cleanup()
         exit(ok ? 0 : 1)

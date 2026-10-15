@@ -95,6 +95,40 @@ fn engine_search_sort_live_update_socket_and_snapshot() {
         paths(&engine, "fresh-file").is_empty()
     });
 
+    // A stale result must never read a reused slab index or sort against another revision.
+    let (old, _, revision) = engine.search_versioned(None,Some("*.bin".into()),false,false).unwrap().unwrap();
+    let old = old.nodes.unwrap();
+    fs::write(root.join("new-version.txt"),"new").unwrap();
+    wait_until("index revision",Duration::from_secs(20),|| engine.status.index_revision.load(std::sync::atomic::Ordering::Relaxed) != revision);
+    assert!(engine.nodes_at(old.clone(),Some(revision)).is_empty());
+    assert!(engine.sort_at(old,SortKey::Name,false,false,Some(revision)).is_none());
+
+    // Pause stops event application; resume replays the skipped changes without a rescan.
+    engine.edit_policy(|p| { p.paused = true;p.auto_snapshot = false; }).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    fs::write(root.join("paused-file.txt"),"paused").unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(paths(&engine,"paused-file").is_empty());
+    let previous_walks = engine.status.walks.load(std::sync::atomic::Ordering::Relaxed);
+    engine.edit_policy(|p| p.paused = false).unwrap();
+    wait_until("resume replays paused events",Duration::from_secs(20),|| paths(&engine,"paused-file") == vec![root.join("paused-file.txt")]);
+    assert_eq!(engine.status.walks.load(std::sync::atomic::Ordering::Relaxed),previous_walks);
+    assert!(!engine.policy().auto_snapshot);
+
+    // A passive batch may combine create/rename/remove events for the same
+    // subtree. A demand read and the final snapshot must see the final state.
+    fs::create_dir_all(root.join("burst")).unwrap();
+    for n in 0..32 {
+        let path = root.join(format!("burst/original-{n}.txt"));
+        fs::write(&path, "before").unwrap();
+        if n % 2 == 0 {
+            fs::rename(&path, root.join(format!("burst/final-{n}.txt"))).unwrap();
+        } else { fs::remove_file(&path).unwrap(); }
+    }
+    wait_until("combined event final state", Duration::from_secs(20), || {
+        paths(&engine, "final-").len() == 16 && paths(&engine, "original-").is_empty()
+    });
+
     // CLI path: the same engine answers over the socket.
     let service = Service::new(engine.clone(), Box::new(|| {}));
     let server = ipc::Server::start(service).unwrap();
@@ -132,6 +166,7 @@ fn engine_search_sort_live_update_socket_and_snapshot() {
     let rows = offline.rows(&hits);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].path, root.join("docs/deep/notes.txt"));
+    assert_eq!(offline.search(None, Some("final-".into()), false).unwrap().len(), 16);
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&support);

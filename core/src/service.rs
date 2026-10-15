@@ -121,14 +121,16 @@ impl Service {
     fn apply_locked(engine: &Engine, current: &mut Config, new: Config, dry_run: bool) -> Result<SettingsChange> {
         let mut new = new;
         new.support_dir = current.support_dir.clone();
-        let new = new.normalized();
+        let new = new.validated()?;
         let changed = new != *current;
+        if changed && engine.status.paused.load(Ordering::Relaxed) { anyhow::bail!("索引已暂停，请先恢复后修改索引范围；原配置未修改"); }
         if dry_run {
             return Ok(SettingsChange { changed, reindexing: false, saved: false, dry_run: true, config: new });
         }
         // Saved even when unchanged, as the window always did: a hand-edited file
         // is replaced by what the user confirmed.
         new.save()?;
+        engine.status.configuration_error.lock().unwrap().clear();
         if changed {
             *current = new.clone();
             engine.reconfigure(new.clone());
@@ -168,6 +170,12 @@ impl Service {
             "rebuild_required": s.rebuild_required.load(Ordering::Relaxed),
             "rebuild_reason": *s.rebuild_reason.lock().unwrap(),
             "repairing": s.repairing.load(Ordering::Relaxed),
+            "paused": s.paused.load(Ordering::Relaxed),
+            "auto_repair": s.auto_repair.load(Ordering::Relaxed),
+            "auto_snapshot": s.auto_snapshot.load(Ordering::Relaxed),
+            "index_revision": s.index_revision.load(Ordering::Relaxed),
+            "configuration_error": *s.configuration_error.lock().unwrap(),
+            "runtime_error": *s.runtime_error.lock().unwrap(),
             "snapshot_writes": s.flushes.load(Ordering::Relaxed),
             "last_snapshot": s.last_flush.load(Ordering::Relaxed),
             "unsaved_changes": s.dirty.load(Ordering::Relaxed),
@@ -195,6 +203,26 @@ impl Service {
 
     pub fn request_quit(&self) {
         (self.quit)();
+    }
+
+    pub fn control(&self, request: &Value) -> Result<Value> {
+        let action = request["action"].as_str().unwrap_or("status");
+        match action {
+            "status" => {},
+            "cancel" => self.engine.cancel_scan(),
+            "pause" | "resume" | "set" => {
+                let repair = request.get("auto_repair").map(|v| v.as_bool().context("auto_repair 必须是布尔值")).transpose()?;
+                let snapshot = request.get("auto_snapshot").map(|v| v.as_bool().context("auto_snapshot 必须是布尔值")).transpose()?;
+                self.engine.edit_policy(|policy| {
+                    if action == "pause" { policy.paused = true; }
+                    if action == "resume" { policy.paused = false; }
+                    if let Some(v) = repair { policy.auto_repair = v; }
+                    if let Some(v) = snapshot { policy.auto_snapshot = v; }
+                })?;
+            },
+            _ => anyhow::bail!("unknown index action {action:?}"),
+        }
+        Ok(self.status_json())
     }
 }
 

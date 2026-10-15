@@ -37,6 +37,11 @@ SiftEngine *sift_engine_start(const char *support_dir);
 void sift_engine_shutdown(SiftEngine *engine);
 void sift_engine_status(const SiftEngine *engine, SiftStatus *out);
 void sift_engine_rescan(const SiftEngine *engine);
+// Rich status and runtime controls use the same Service path as the CLI socket.
+char *sift_engine_details(const SiftEngine *engine);
+char *sift_remote_status(const char *support_dir);
+char *sift_engine_control(const SiftEngine *engine, const char *json);
+char *sift_results_locate(const SiftEngine *engine, const SiftResults *results, const char *paths_json);
 
 SiftResults *sift_search(const SiftEngine *engine, const char *query, const char *directory,
                          bool case_insensitive, int32_t *code, char **error);
@@ -44,6 +49,8 @@ uint64_t sift_results_len(const SiftResults *results);
 // Search time on the index thread, excluding queueing and index loading.
 uint64_t sift_results_micros(const SiftResults *results);
 char *sift_results_highlights(const SiftResults *results);
+// Actual fallback query, or NULL for a strict search. Free with sift_string_free.
+char *sift_results_loosened(const SiftResults *results);
 bool sift_results_sort(const SiftEngine *engine, SiftResults *results, uint8_t key, bool descending);
 uint64_t sift_results_rows(const SiftEngine *engine, const SiftResults *results, uint64_t start,
                            uint64_t count, SiftRow *out);

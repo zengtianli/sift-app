@@ -5,9 +5,19 @@ import AppKit
 // and update source (Lifecycle). It returns here, before any NSApplication exists: no window, no Dock icon, no
 // engine, no index. A Sift that is already running is not touched; it follows through AppLifecycleCLI.follow.
 let launchWords = Array(CommandLine.arguments.dropFirst())
+#if APP_STORE
+// The Mac App Store build has no `sift` CLI and no updater of its own (the App Store updates it); its settings
+// travel through Settings › Export / Import and the iCloud switch. The command words are refused, not taken for
+// a launch of the window.
+if let verb = launchWords.first, ["config", "update"].contains(verb) {
+    FileHandle.standardError.write(Data("sift: `\(verb)` is not part of the Mac App Store build of Sift\n".utf8))
+    exit(2)
+}
+#else
 if AppLifecycleCLI.handles(launchWords.first) { exit(Lifecycle.run(launchWords)) }
 // Before anything reads the environment: the lifecycle self-test runs on its own fixture, folders and preferences.
 if Prefs.lifecycleSelfTest { LifecycleSelfTest.prepareEnvironment(arguments: launchWords) }
+#endif
 
 let app = NSApplication.shared
 let delegate = AppDelegate()

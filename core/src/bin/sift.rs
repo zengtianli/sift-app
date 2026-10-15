@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use sift_core::{
     config::{Config, ConfigEdit, socket_path_in},
     engine::{SortKey, rebuild_marker},
-    ipc::{self, Hit, Request, TimedOut},
+    ipc::{self, Hit, Request, SocketBlocked, TimedOut},
     offline::Offline,
     service::bundle_info,
 };
@@ -45,7 +45,7 @@ const BUNDLE_ID: &str = "cyou.tianli.sift";
 macro_rules! lifecycle_reads {
     () => {
         "  config status              「使用 iCloud 记住配置」开关、开关下面那句同步状态、当前可迁移的配置项、App 是否在运行（只读）
-  update check               检查更新：当前版本、此渠道最新版本、有没有新版、怎么升级（只读；私有渠道读 iCloud Drive 里的发行记录，公开渠道联网读发行记录）"
+  update check               检查更新：当前版本、此渠道最新版本、有没有新版、怎么升级（不改配置或安装；记录本机检查结果；私有渠道读 iCloud Drive 里的发行记录，公开渠道联网读发行记录）"
     };
 }
 macro_rules! lifecycle_writes {
@@ -53,7 +53,8 @@ macro_rules! lifecycle_writes {
         "  config export -o <file>        导出配置：与窗口「导出配置…」同一份文件；不改设置，只写你指定的那个文件（--force 覆盖；-o - 输出到标准输出，不写文件）
   config import <file> --yes     导入配置：先备份原配置再覆盖，与窗口「导入配置…」相同
   config sync on|off --yes       拨动「使用 iCloud 记住配置」（--dry-run 只看会不会变；用 sift config status 回读）
-  update install --yes           升级到新版：与窗口「升级到新版…」同一条路——验证发行包与签名、替换当前 App，运行中的先退出、换好再重开；配置保留，替换失败回滚（--dry-run 只看会做什么；用 sift update check 回读）"
+  update install --yes           升级到新版：与窗口「升级到新版…」同一条路——验证发行包与签名、替换当前 App，运行中的先退出、换好再重开；配置保留，替换失败回滚（--dry-run 只看会做什么；用 sift update check 回读）
+  update options [--yes]     查看或保存自动检查/下载/安装、间隔、渠道、跳过与延后选项（--dry-run 只预演）"
     };
 }
 
@@ -81,13 +82,14 @@ USAGE:
 
 The 配置与更新… window as commands, each as `sift <line>` (text, or one JSON object with
 --json; the same settings and release channel as the window; `sift help update`):
- read (write no file and no state):
+ read (update check records local check history):
 ", lifecycle_reads!(), "
  write:
 ", lifecycle_writes!(), "
 
 READ COMMANDS (change nothing): search, status, config, history, hotkey, login-item,
-  version, help, config status, update check. `sift status --json` is the read-back after
+  version, help, config status, index status, shortcuts list, saved list, file info.
+  update check only records local check history. `sift status --json` is the read-back after
   any index or settings write and after login-item on|off; `sift hotkey --json` after
   hotkey set|clear; `sift config status --json` after config import / config sync;
   `sift update check --json` after update install.
@@ -95,14 +97,17 @@ WRITE COMMANDS: config set (settings; a real change re-indexes from scratch), re
   (rebuilds the index), flush (saves the index), start, quit, history clear, trash (moves
   the files you name to the Trash), hotkey set, hotkey clear, login-item on|off, config
   export (changes no setting, writes only the file you name), config import, config sync,
-  update install (replaces Sift.app with the channel's newer release).
+  update install (replaces Sift.app with the channel's newer release), update options,
+  index pause|resume|cancel|set, shortcuts set|clear, saved add|remove, file rename,
+  export (writes only the named destination or stdout).
 No command opens a window, takes focus, asks for a permission or sends keys.
 
 JSON: read commands print text, or one JSON object with --json. The index write commands
 (config set, rescan, flush, start, quit), history clear, trash, hotkey set|clear and
 login-item on|off always print one JSON line (--json is accepted).
   search      {ok, live, total, offset, search_ms, case_insensitive, rebuild_required,
-               state, repairing, results:[{path, kind, size, mtime, ctime}]}
+               state, repairing, results:[{path, kind, size, mtime, ctime}], loosened?:actual_query}
+              loosened is present only when a zero-result strict query found rows after expansion
   status      {ok, running, live, state, files, events, walks, rebuild_required, repairing,
                root, ignore_paths, include_paths, full_disk_access, login_item, app, pid,
                gui:{case_insensitive, show_folder_scope, hotkey}}; while Sift is not
@@ -145,12 +150,15 @@ login-item on|off always print one JSON line (--json is accepted).
                target exists, no --force) | not_found | import_rejected | export_failed |
                sync_incomplete | check_incomplete | no_settings | manual_install |
                needs_product_installer | upgrade_failed | app_busy | replace_failed |
-               cleanup_failed | trash_failed | in_use (hotkey set: stored, but the system
-               refused the registration) | invalid_shortcut | login_item_failed |
+               cleanup_failed | trash_failed | in_use (hotkey set: previous binding retained
+               when the replacement is refused) | invalid_shortcut | login_item_failed |
                unavailable (a --headless Sift) | app_outdated (the running Sift is older
                than this sift) | failed | not_running | app_missing | app_failed | timeout
 Whether Sift runs: key on the exit code (3) or `running`, not on `ok` (`status`
 still reports the saved index with ok:true, running:false, exit:3).
+Socket permission/sandbox denial instead returns {ok:false, code:socket_blocked,
+exit:2, error:reason}, with no running field; start does not relaunch. Retry with
+~/Dev/tools/dev/lib/tools/cc/guarded-bin/outside-guard -- sift <command>.
 
 EXIT CODES:
   0  ok / results found (update install with nothing newer: 0, installed false)
@@ -183,6 +191,23 @@ SIFT_SUPPORT_DIR points the app and the CLI at another index/settings folder
 (tests, side-by-side runs); the default is ~/Library/Application Support/cyou.tianli.sift.
 SIFT_PREFS_DOMAIN points the CLI's read of the window's preferences (status gui,
 history) at another defaults domain or plist path (tests).");
+
+const PRODUCT_HELP: &str = "\
+Sift 运行、快捷键和常用搜索（窗口与 CLI 共用业务）
+  sift index [status|pause|resume|cancel] [--json]
+  sift index set [--auto-repair on|off] [--auto-save on|off]
+  sift shortcuts list [--json]
+  sift shortcuts set <action> <combo> [--scope app|global]
+  sift shortcuts clear <action|all|defaults>
+  sift saved list [--json]
+  sift saved add <name> <query> [--dir <folder>] [--case]
+  sift saved remove <name>
+  sift file info <path> [--json]
+  sift file rename <path> <new-name> --yes
+  sift export <query> [-o <file>] [--format json|csv|paths] [--force]
+动作输出一行 JSON。index/shortcuts/saved/file 需要 App 在运行（退出 3）。
+export 只读同一搜索引擎；默认 50 条，--limit 0 全部，可 --offline、--dir、--sort、--desc。
+export -o 不覆盖已有文件，除非 --force；路径必须由用户显式指定。\n";
 
 const TRASH_HELP: &str = "\
 sift trash <path...> --yes [--timeout SECS]
@@ -218,18 +243,18 @@ Sift from any app). Off by default. The running Sift holds the registration, so 
 three need it (exit 3 otherwise; `sift hotkey` then still prints the stored one).
 
 `sift hotkey` prints what Settings shows: the stored combination, whether Sift has it
-registered, and in_use, the window's orange \"In use by another app\" note (a combination
-is stored but the system refused to register it).
+registered, and in_use, the window's orange note. If the replacement is occupied,
+the previous stored combination and registration are retained.
 
-`sift hotkey set <combo>` does what recording a combination in Settings does: stores it
-and registers it at once. <combo> is modifiers and a key joined by +, as `sift hotkey`
+`sift hotkey set <combo>` does what recording a combination in Settings does: registers
+it before saving. <combo> is modifiers and a key joined by +, as `sift hotkey`
 and status gui.hotkey print it: cmd+shift+space, option+ctrl+k, cmd+keycode96 (a key
 without a name here, by its virtual key code). Modifiers: cmd, option, ctrl, shift, typed
 in any order (they are printed in that one); at least one, and not shift alone. `cardinal`
 is the Settings button Use ⇧⌘Space (as in Cardinal). The stored form
 <keyCode>:<modifierFlags> is accepted too.
-When the system refuses the registration the combination stays stored, as in the window,
-and the command fails: exit 1, code in_use, with the same fields.
+When the system refuses the replacement, the previous shortcut stays active and stored;
+the command fails: exit 1, code in_use, with the same fields.
 
 `sift hotkey clear` is the Clear button: the combination is unregistered and forgotten.
 
@@ -267,7 +292,7 @@ index for every call (about 10–40 s and 0.5–0.7 GB for ~9M entries) and miss
 changes made since the last save.
 
 OPTIONS:
-      --dir <query>     Only inside folders matching this query (the window's ⌘D field)
+      --dir <query>     Only inside folders matching this query; the window uses one query field
   -i, --ignore-case     Case-insensitive (the window's default)
       --match-case      Case-sensitive (the CLI's default; the JSON echoes the mode)
   -n, --limit <N>       Max results (default 50, 0 = all)
@@ -277,7 +302,8 @@ OPTIONS:
       --desc            Reverse order
       --json            One object: ok, live, total, offset, search_ms, case_insensitive,
                         rebuild_required, (live) state, repairing, (offline) snapshot,
-                        results[{path, kind, size, mtime, ctime}]
+                        results[{path, kind, size, mtime, ctime}], loosened?:actual_query
+                        loosened reports the actual expanded query only when it found results
       --offline         Read the saved index (no running app needed)
       --timeout <SECS>  Give up after SECS (exit 4) instead of waiting while the index
                         loads or a full rebuild holds it
@@ -286,6 +312,12 @@ OPTIONS:
 Query syntax (Cardinal): words AND together, `a|b` OR, `!x` NOT, `ext:pdf`, `*.rs`,
 `\"exact phrase\"`, `parent:/path`, `size:>1mb`, `dm:today`, `regex:…`. A pasted real
 path with spaces or brackets is searched as one phrase.
+
+Loose folder words: a query that finds nothing as written is tried again with folder
+names allowed anywhere above the file. `docs/ report`, `docs report` and `docs/report`
+then all find names containing `report` at any depth under a folder whose name contains
+`docs`. A query that finds something as written is never widened; filters, `!x`,
+wildcards, quotes and groups stay literal, and so do words under 3 letters (2 for CJK).
 
 EXIT: 0 results, 1 no results, 2 error, 3 app not running (use --offline), 4 timeout";
 
@@ -296,7 +328,9 @@ Running app: index state (starting | loading | scanning | updating | ready |
 rebuild_required | stopped), entries, file events, completed full walks
 (walks, last_walk), rebuild/repair flags, snapshot writes, the live settings,
 Full Disk Access as Sift itself sees it, the login item, the app version/build,
-and the window's preferences (gui: match case default, folder field, global hotkey).
+and the window's preferences (gui: match case default, legacy scope flag, global hotkey).
+The legacy show_folder_scope flag is retained for configuration compatibility;
+the window always has one query field.
 
 App not running: the saved snapshot (path, bytes, mtime), the rebuild marker,
 the settings in config.json and the window's preferences, with ok:true (the report
@@ -433,18 +467,22 @@ sift config import <file.json> --yes [--json]
 sift config sync on|off --yes [--dry-run] [--json]
 sift update check [--json]
 sift update install --yes [--dry-run] [--json]
+sift update options [--auto-check on|off] [--auto-download on|off] [--auto-install on|off]
+  [--interval 1..720] [--channel <name>] [--skip <version/build|clear>] [--remind 0..720] [--yes|--dry-run] [--json]
 
 The functions of the 配置与更新… window (Sift menu), on the same settings, the same
 release channel and the same installer as the window. Sift.app's own executable does
 the work (it opens no window and no index); a running Sift follows the change.
- read (write no file and no state):
+ read (update check records local check history):
 ", lifecycle_reads!(), "
  write:
 ", lifecycle_writes!(), "
 
 What travels with an export, an import and the iCloud copy: the global shortcut, the
-Match Case default, whether the folder field is shown (window preferences), and the
-index root, skipped folders and still-included folders (config.json). Recent searches,
+Match Case default, legacy scope flag (the window always has one query field),
+action shortcuts, sort order, named searches,
+update options, the index root, skipped/still-included folders and automatic repair/save.
+Recent searches,
 the window layout, Open Sift at login and Full Disk Access stay on this Mac.
 
 `config import … --yes` and `config sync on --yes` can rewrite config.json (an import
@@ -529,7 +567,8 @@ fn not_running(hint: &str) -> anyhow::Error {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let as_json = args.iter().take_while(|a| *a != "--").any(|a| a == "--json");
+    let as_json = args.iter().take_while(|a| *a != "--").any(|a| a == "--json")
+        || args.first().is_some_and(|s| ["index","shortcuts","saved","file","export"].contains(&s.as_str()));
     match run(&args) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
@@ -540,6 +579,9 @@ fn main() -> ExitCode {
             };
             if as_json {
                 let mut out = json!({"ok": false, "error": format!("{e:#}"), "exit": code});
+                if e.downcast_ref::<SocketBlocked>().is_some() {
+                    out["code"] = json!("socket_blocked");
+                }
                 if code == NOT_RUNNING {
                     out["running"] = json!(false);
                 }
@@ -553,8 +595,7 @@ fn main() -> ExitCode {
 
 fn run(args: &[String]) -> Result<u8> {
     let Some((cmd, rest)) = args.split_first() else {
-        println!("{HELP}");
-        return Ok(0);
+        return show_help(None);
     };
     match cmd.as_str() {
         "-h" | "--help" => show_help(None),
@@ -566,6 +607,9 @@ fn run(args: &[String]) -> Result<u8> {
         "-V" | "--version" | "version" => version(rest),
         "search" | "s" => search(rest),
         "status" => status(rest),
+        "index" => index_control(rest),
+        "shortcuts" | "saved" | "file" => product_action(cmd, rest),
+        "export" => export_results(rest),
         "history" => match rest.first().map(String::as_str) {
             Some("clear") => history_clear(args),
             _ => history(rest),
@@ -592,10 +636,12 @@ fn run(args: &[String]) -> Result<u8> {
 }
 
 fn show_help(topic: Option<&str>) -> Result<u8> {
+    if topic.is_none() { println!("{HELP}\n{PRODUCT_HELP}"); return Ok(0); }
     let text = match topic {
         None => HELP,
         Some("search" | "s") => SEARCH_HELP,
         Some("status") => STATUS_HELP,
+        Some("index" | "shortcuts" | "saved" | "file" | "export") => PRODUCT_HELP,
         Some("config" | "config set") => CONFIG_HELP,
         Some("rescan") => RESCAN_HELP,
         Some("flush") => FLUSH_HELP,
@@ -606,7 +652,7 @@ fn show_help(topic: Option<&str>) -> Result<u8> {
         Some("trash") => TRASH_HELP,
         Some("hotkey" | "hotkey set" | "hotkey clear") => HOTKEY_HELP,
         Some("login-item" | "login-item on" | "login-item off") => LOGIN_ITEM_HELP,
-        Some("update" | "update check" | "update install" | "config status" | "config export" | "config import" | "config sync") => LIFECYCLE_HELP,
+        Some("update" | "update check" | "update install" | "update options" | "config status" | "config export" | "config import" | "config sync") => LIFECYCLE_HELP,
         Some(other) => bail!("no help for {other:?} (see `sift --help`)"),
     };
     println!("{text}");
@@ -872,12 +918,106 @@ fn search(args: &[String]) -> Result<u8> {
     Ok(if total == 0 { NO_RESULTS } else { 0 })
 }
 
+fn index_control(args: &[String]) -> Result<u8> {
+    let Some(p) = parse("index", args, &["--json"], &["--auto-repair", "--auto-save"], true)? else { return show_help(Some("index")); };
+    if p.words.len() > 1 { bail!("index expects one action"); }
+    let action = p.words.first().map(String::as_str).unwrap_or("status");
+    if !["status", "pause", "resume", "cancel", "set"].contains(&action) { bail!("unknown index action {action:?}"); }
+    if action != "set" && !p.opts.iter().all(|(k,_)| k == "--json") { bail!("runtime options require index set"); }
+    let mut body = json!({"action": action});
+    for (flag, key) in [("--auto-repair", "auto_repair"), ("--auto-save", "auto_snapshot")] {
+        if let Some(v) = p.value(flag) { body[key] = json!(match v { "on" => true, "off" => false, _ => bail!("{flag} expects on or off") }); }
+    }
+    let req = Request { op: "control".into(), action: Some(body), ..Default::default() };
+    let v = live_request(&req, None)?.ok_or_else(|| not_running(""))?;
+    ensure_ok(&v)?; print_line(&v)?; Ok(0)
+}
+
+fn product_action(verb: &str, args: &[String]) -> Result<u8> {
+    let Some(p) = parse(verb, args, &["--json", "--yes", "--case"], &["--scope", "--dir"], true)? else { println!("{PRODUCT_HELP}"); return Ok(0); };
+    let words: Vec<_> = p.words.iter().map(String::as_str).collect();
+    let mut action = match (verb, words.as_slice()) {
+        ("shortcuts", [] | ["list"]) => json!({"action":"shortcuts"}),
+        ("shortcuts", ["set", id, _]) => json!({"action":"shortcut_set","id":id,"scope":p.value("--scope").unwrap_or("app")}),
+        ("shortcuts", ["clear", id]) => json!({"action":"shortcut_clear","id":id}),
+        ("saved", [] | ["list"]) => json!({"action":"saved"}),
+        ("saved", ["add", name, query]) => json!({"action":"saved_add","name":name,"query":query,"dir":p.value("--dir").unwrap_or(""),"case_insensitive":!p.has("--case")}),
+        ("saved", ["remove", name]) => json!({"action":"saved_remove","name":name}),
+        ("file", ["info", path]) => json!({"action":"file_info","path":path}),
+        ("file", ["rename", path, name]) if p.has("--yes") => json!({"action":"file_rename","path":path,"name":name,"confirmed":true}),
+        _ => bail!("invalid {verb} arguments; see sift {verb} --help"),
+    };
+    if p.value("--scope").is_some() && action["action"] != "shortcut_set" { bail!("--scope is only for shortcuts set"); }
+    if (p.value("--dir").is_some() || p.has("--case")) && action["action"] != "saved_add" { bail!("--dir/--case are only for saved add"); }
+    if p.has("--yes") && action["action"] != "file_rename" { bail!("--yes is only for file rename"); }
+    if action["action"] == "file_info" || action["action"] == "file_rename" {
+        action["path"] = serde_json::to_value(typed_path(action["path"].as_str().unwrap_or(""))?)?;
+    }
+    if action["action"] == "shortcut_set" {
+        let scope = action["scope"].as_str().unwrap_or("");
+        if !["app","global"].contains(&scope) { bail!("scope expects app or global"); }
+        let combo = prefs::parse_combo(words[2]).map_err(|e| fail(ERROR, e))?;
+        action["stored"] = json!(combo);
+    }
+    match ask_app(verb, action, Duration::from_secs(20), true)? {
+        AppReply::Done(v) => { print_line(&v)?; Ok(0) },
+        AppReply::NotRunning => app_not_running(verb, p.has("--json")),
+        AppReply::Failed(code) => Ok(code),
+    }
+}
+
+fn export_results(args: &[String]) -> Result<u8> {
+    let Some(p) = parse("export", args, &["--json", "--force", "--offline", "--desc", "-i"], &["-o", "--format", "--limit", "--dir", "--sort"], true)? else { return show_help(Some("export")); };
+    let format = p.value("--format").unwrap_or("json");
+    if !["json", "csv", "paths"].contains(&format) { bail!("format expects json, csv or paths"); }
+    if p.words.is_empty() { bail!("export needs a query"); }
+    let limit = p.value("--limit").unwrap_or("50").parse::<usize>().context("--limit expects a number")?;
+    if let Some(sort) = p.value("--sort") { SortKey::parse(sort).context("invalid sort")?; }
+    let req = Request { op: "search".into(), query: Some(p.words.join(" ")), dir: p.value("--dir").map(str::to_owned),
+        limit: (limit != 0).then_some(limit), sort: p.value("--sort").map(str::to_owned), desc: p.has("--desc"), case_insensitive: p.has("-i"), ..Default::default() };
+    let v = if p.has("--offline") { offline_search(&req)? } else { live_request(&req, None)?.ok_or_else(|| not_running(""))? };
+    ensure_ok(&v)?;
+    let rows = v["results"].as_array().context("missing results")?;
+    let text = match format {
+        "paths" => rows.iter().map(|r| format!("{}\n", r["path"].as_str().unwrap_or(""))).collect::<String>(),
+        "csv" => {
+            let mut out = String::from("path,kind,size,modified,created\r\n");
+            for r in rows {
+                let values = ["path","kind","size","mtime","ctime"].map(|k| {
+                    let v = if let Some(s) = r[k].as_str() { s.to_owned() } else if r[k].is_null() { String::new() } else { r[k].to_string() };
+                    format!("\"{}\"", v.replace('"', "\"\""))
+                });
+                out.push_str(&values.join(","));out.push_str("\r\n");
+            }
+            out
+        },
+        _ => serde_json::to_string_pretty(&v)? + "\n",
+    };
+    if let Some(path) = p.value("-o") {
+        use std::io::Write;
+        let destination = std::path::Path::new(path);
+        let parent = destination.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+        let temporary = parent.join(format!(".sift-export-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
+        let result = (|| -> Result<()> {
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+            file.write_all(text.as_bytes())?;file.sync_all()?;drop(file);
+            if p.has("--force") { std::fs::rename(&temporary,destination)?; }
+            else { std::fs::hard_link(&temporary,destination).context("export destination exists or cannot be created; use --force only to replace it")?; }
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&temporary);result?;
+        print_line(&json!({"ok":true,"path":path,"format":format,"exported":rows.len(),"total":v["total"]}))?;
+    } else { print!("{text}"); }
+    Ok(0)
+}
+
 fn offline_search(req: &Request) -> Result<Value> {
     let config = Config::load(&support_dir())?;
     let mut index = Offline::open(&config)?;
     // Search and sort time only, like the live figure (loading the snapshot is not counted).
     let searched = Instant::now();
-    let mut indices = index.search(req.dir.clone(), req.query.clone(), req.case_insensitive)?;
+    let outcome = index.search_with_metadata(req.dir.clone(), req.query.clone(), req.case_insensitive)?;
+    let mut indices = outcome.nodes.unwrap_or_default();
     if let Some(key) = req.sort.as_deref().and_then(SortKey::parse) {
         indices = index.sort(indices, key, req.desc);
     } else if req.desc {
@@ -889,7 +1029,7 @@ fn offline_search(req: &Request) -> Result<Value> {
     let end = req.limit.map_or(total, |l| start.saturating_add(l).min(total));
     let hits: Vec<Hit> = index.rows(&indices[start..end]).into_iter().map(Hit::from).collect();
     let (rebuild_required, _) = marker_state(&config);
-    Ok(json!({
+    let mut response = json!({
         "ok": true,
         "live": false,
         "total": total,
@@ -899,7 +1039,9 @@ fn offline_search(req: &Request) -> Result<Value> {
         "rebuild_required": rebuild_required,
         "snapshot": snapshot_info(&config),
         "results": hits,
-    }))
+    });
+    if let Some(loosened) = outcome.loosened { response["loosened"] = json!(loosened); }
+    Ok(response)
 }
 
 // ── status / config / version ───────────────────────────────────────────────
@@ -1715,8 +1857,7 @@ fn hotkey_set(args: &[String]) -> Result<u8> {
             as_json,
             1,
             "in_use",
-            "the combination is stored, but the system refused to register it (Settings shows \"In use by another app\"): \
-             set another one or `sift hotkey clear`",
+            "the system refused the new combination; the previous shortcut was kept; set another one or sift hotkey clear",
             v,
         );
     }
@@ -1949,6 +2090,10 @@ mod prefs {
         (29, "0"), (30, "]"), (31, "o"), (32, "u"), (33, "["), (34, "i"), (35, "p"), (36, "return"), (37, "l"),
         (38, "j"), (39, "'"), (40, "k"), (41, ";"), (42, "\\"), (43, ","), (44, "/"), (45, "n"), (46, "m"),
         (47, "."), (48, "tab"), (49, "space"), (50, "`"), (51, "delete"), (53, "escape"),
+        (76,"enter"),(117,"forward-delete"),(123,"left"),(124,"right"),(125,"down"),(126,"up"),
+        (115,"home"),(119,"end"),(116,"page-up"),(121,"page-down"),
+        (122,"f1"),(120,"f2"),(99,"f3"),(118,"f4"),(96,"f5"),(97,"f6"),(98,"f7"),(100,"f8"),(101,"f9"),(109,"f10"),
+        (103,"f11"),(111,"f12"),(105,"f13"),(107,"f14"),(113,"f15"),(106,"f16"),(64,"f17"),(79,"f18"),(80,"f19"),(90,"f20"),
     ];
 
     fn key_name(code: u32) -> String {

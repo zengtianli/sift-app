@@ -92,6 +92,9 @@ fn help_and_strict_parsing_never_run_commands() {
     }
     // Typos are errors, not query words or silently ignored flags.
     for args in [vec!["search", "--jsn", "readme"], vec!["rescan", "--bogus"], vec!["status", "extra"],
+                 vec!["shortcuts","set","export","cmd+e","--scope","nope"],vec!["shortcuts","list","--case"],
+                 vec!["saved","list","--dir","Work"],vec!["file","rename","/tmp/own.txt","new.txt"],
+                 vec!["export","notes","--format","invalid"],vec!["index","set","--auto-save","maybe"],
                  vec!["search", "--sort", "bogus", "x"], vec!["search", "-n", "abc", "x"], vec!["nope"],
                  vec!["config", "set"], vec!["rescan", "--wait", "0"], vec!["history", "--bogus"],
                  vec!["history", "extra"], vec!["history", "--limit", "x"], vec!["trash"], vec!["trash", "--yes"],
@@ -131,7 +134,7 @@ fn top_level_help_is_the_agent_contract() {
     }
     for part in ["READ COMMANDS", "WRITE COMMANDS", "--json", "EXIT CODES:", "WINDOW ONLY", "仅在窗口中",
                  "\"ok\":false", "  3  Sift.app is not running", "Show in Finder", "Quick Look", "Recording the global shortcut",
-                 "Full Disk Access"] {
+                 "Full Disk Access", "loosened?:actual_query", "socket_blocked", "outside-guard -- sift"] {
         assert!(help.contains(part), "top-level help lacks {part:?}");
     }
     // The 配置与更新… window's commands: each at the start of a line, as the shared layer words them.
@@ -167,8 +170,16 @@ fn top_level_help_is_the_agent_contract() {
     for args in [vec!["hotkey", "--help"], vec!["hotkey", "set", "--help"], vec!["help", "hotkey", "clear"]] {
         assert_eq!(sift(&support, &args).1, hotkey, "sift {args:?}");
     }
-    assert!(hotkey.contains("In use by another app") && sift(&support, &["trash", "--help"]).1.contains("--yes")
+    assert!(hotkey.contains("previous shortcut stays active") && sift(&support, &["trash", "--help"]).1.contains("--yes")
         && sift(&support, &["login-item", "--help"]).1.contains("Open Sift at login"));
+    // A retained configuration flag must not promise a removed second input or shortcut.
+    for args in [vec!["help", "search"], vec!["help", "status"], vec!["help", "config", "export"]] {
+        let text = sift(&support, &args).1;
+        assert!(text.contains("one query field"), "{args:?} help must describe the single input");
+        for old in ["⌘D field", "folder field visibility", "folder field, global"] {
+            assert!(!text.contains(old), "{args:?} help still promises {old}");
+        }
+    }
     // Same text without a command and through `help`; none of them touched the support dir.
     assert_eq!(sift(&support, &[]).1, help);
     assert_eq!(sift(&support, &["help"]).1, help);
@@ -285,6 +296,38 @@ fn history_clear_removes_the_recent_searches_and_nothing_else() {
 }
 
 #[test]
+fn socket_denial_is_an_error_and_never_starts_another_app() {
+    use std::os::unix::net::UnixListener;
+    let support = unique_dir("blocked");
+    let socket = sift_core::config::socket_path_in(&support);
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    // A genuine macOS seatbelt denial against a listening private socket, without
+    // changing the owner's socket permissions or synthesizing an IPC error.
+    for args in [vec!["status", "--json"], vec!["search", "readme", "--json"],
+                 vec!["start", "--json"], vec!["start", "--dry-run", "--json"]] {
+        let out = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1)(allow default)(deny network-outbound)"])
+            .arg(env!("CARGO_BIN_EXE_sift")).args(&args)
+            .env("SIFT_SUPPORT_DIR", &support).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stdout} {stderr}");
+        let v: Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["code"], "socket_blocked");
+        assert_eq!(v["exit"], 2);
+        assert!(v.get("running").is_none() && v.get("started").is_none() && v.get("would_run").is_none(), "{v}");
+        assert!(v["error"].as_str().unwrap().contains("outside-guard -- sift"));
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+    drop(listener);
+    // A stale socket (ECONNREFUSED), like a missing one, still means not running.
+    assert_eq!(sift_json(&support, &["status", "--json"], 3)["running"], false);
+    fs::remove_dir_all(support).unwrap();
+}
+
+#[test]
 fn not_running_reports_disk_state_and_exit_3() {
     let support = unique_dir("down");
     let v = sift_json(&support, &["status", "--json"], 3);
@@ -347,6 +390,38 @@ fn live_cli_through_the_shared_service() {
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
     assert_eq!(live_sorted, expected);
+
+    // A folder next to a file name finds nothing as written (one name would need both),
+    // so the looser reading answers: the folder may be anywhere above the file.
+    let notes = vec![root.join("docs/readme-notes.txt").to_string_lossy().into_owned()];
+    for query in [&["docs/", "notes"][..], &["/docs/", "notes"], &["docs", "notes"], &["docs/notes"], &["docs/", "ext:txt"]] {
+        let args = [&["search", "--json", "-n", "0", "-i"][..], query].concat();
+        assert_eq!(paths(&sift_json(&support, &args, 0)), notes, "{query:?}");
+    }
+    // Nothing under that folder: still no result, and no error.
+    assert_eq!(sift_json(&support, &["search", "--json", "-i", "skipme/", "notes"], 1)["total"], 0);
+    // A query that finds something as written is never widened: `docs/ ` alone is the folder.
+    assert_eq!(paths(&sift_json(&support, &["search", "--json", "-i", "docs/"], 0)), vec![root.join("docs").to_string_lossy()]);
+
+    // Both transports report the exact expansion, without labelling strict or failed searches.
+    sift_json(&support, &["flush"], 0);
+    for offline in [false, true] {
+        let base = if offline { vec!["search", "--json", "-i", "--offline"] } else { vec!["search", "--json", "-i"] };
+        for (query, expected) in [
+            ("docs/ notes", "*docs*/** notes"),
+            ("docs notes", "(docs|*docs*/**) (notes|*notes*/**)"),
+            ("docs/notes", "*docs*/**/*notes*"),
+        ] {
+            let args = [base.as_slice(), &[query]].concat();
+            let value = sift_json(&support, &args, 0);
+            assert_eq!(value["loosened"], expected, "{args:?}: {value}");
+            assert_eq!(paths(&value), notes);
+        }
+        for (query, exit) in [("docs/", 0), ("skipme/ notes", 1), ("\"docs notes\"", 1)] {
+            let value = sift_json(&support, &[base.as_slice(), &[query]].concat(), exit);
+            assert!(value.get("loosened").is_none(), "{query}: {value}");
+        }
+    }
 
     // Status: live settings, walk counter, permission and login-item fields.
     let status = sift_json(&support, &["status", "--json"], 0);

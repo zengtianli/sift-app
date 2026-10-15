@@ -30,7 +30,7 @@ enum SortKey: UInt8, CaseIterable {
     case name = 0, path, size, modified, created
 }
 
-struct FileRow {
+struct FileRow: Equatable {
     let path: String
     let size: Int64
     let mtime: UInt32
@@ -48,6 +48,7 @@ final class ResultSet {
     fileprivate let raw: OpaquePointer
     let count: Int
     let highlights: [String]
+    let loosened: String?
     /// Search time on the index thread (not time spent waiting for the index).
     let searchMillis: Double
 
@@ -55,6 +56,10 @@ final class ResultSet {
         self.raw = raw
         count = Int(sift_results_len(raw))
         searchMillis = Double(sift_results_micros(raw)) / 1000
+        if let c = sift_results_loosened(raw) {
+            loosened = String(cString: c)
+            sift_string_free(c)
+        } else { loosened = nil }
         if let c = sift_results_highlights(raw) {
             highlights = String(cString: c).split(separator: "\n").map(String.init)
             sift_string_free(c)
@@ -103,6 +108,26 @@ final class Engine {
         return EngineStatus(
             state: EngineState(rawValue: s.state) ?? .starting,
             files: s.files, events: s.events, unsaved: s.dirty)
+    }
+
+    func details() -> [String: Any] {
+        guard let text = sift_engine_details(raw) else { return [:] }
+        defer { sift_string_free(text) }
+        return (try? JSONSerialization.jsonObject(with: Data(String(cString: text).utf8))) as? [String: Any] ?? [:]
+    }
+    func locate(_ results:ResultSet,paths:Set<String>) -> IndexSet {
+        guard !paths.isEmpty,let data = try? JSONSerialization.data(withJSONObject:Array(paths)),
+              let text = String(decoding:data,as:UTF8.self).withCString({sift_results_locate(raw,results.raw,$0)}) else { return [] }
+        defer{sift_string_free(text)}
+        let positions = (try? JSONSerialization.jsonObject(with:Data(String(cString:text).utf8))) as? [Int] ?? []
+        return IndexSet(positions.filter{$0 >= 0 && $0 < results.count})
+    }
+
+    @discardableResult func control(_ request: [String: Any]) -> [String: Any] {
+        guard let data = try? JSONSerialization.data(withJSONObject: request),
+              let text = String(decoding: data, as: UTF8.self).withCString({ sift_engine_control(raw, $0) }) else { return ["ok": false] }
+        defer { sift_string_free(text) }
+        return (try? JSONSerialization.jsonObject(with: Data(String(cString: text).utf8))) as? [String: Any] ?? ["ok": false]
     }
 
     func search(query: String, folder: String?, caseInsensitive: Bool) -> SearchOutcome {

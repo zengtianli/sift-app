@@ -78,7 +78,10 @@ final class UISelfTest {
         }
         let test = UISelfTest(engine: engine, search: searchWindow, hotkey: hotkey, outDir: out)
         current = test
-        Task { @MainActor in await test.run() }
+        Task { @MainActor in
+            if args.contains("--demo-capture") { await test.recordDemo() }
+            else { await test.run() }
+        }
     }
 
     private init(engine: Engine, search: SearchWindowController, hotkey: GlobalHotkey, outDir: URL) {
@@ -89,6 +92,74 @@ final class UISelfTest {
     }
 
     // MARK: Helpers
+
+    /// Continuous, hidden native-view capture. Calls the same search/sort actions as the UI;
+    /// recorded pointer events describe these in-process actions, never system input.
+    private func recordDemo() async {
+        mark("demo capture")
+        guard Prefs.readOnly, NSApp.activationPolicy() == .prohibited,
+              await waitUntil(20, { engine.status().state == .ready }) else { exit(1) }
+        search.prepareOffscreen(size: NSSize(width: 1000, height: 600))
+        if !search.caseInsensitiveForTesting { search.toggleCase(nil) }
+        NSApp.appearance = NSAppearance(named: .aqua)
+        search.window?.appearance = NSApp.appearance
+        search.setQuery("")
+        let frames = outDir.appendingPathComponent("frames")
+        try? FileManager.default.createDirectory(at: frames, withIntermediateDirectories: true)
+        let fps = 12, count = 216
+        var events: [[String: Any]] = []
+        var facts: [[String: Any]] = []
+        let started = ProcessInfo.processInfo.systemUptime
+        let field = search.searchFieldForTesting
+        let rect = field.convert(field.bounds, to: search.window!.contentView!)
+        let fieldBox: [Double] = [Double(rect.minX), Double(600 - rect.maxY), Double(rect.width), Double(rect.height)]
+        func event(_ type: String, _ t: Double, _ box: [Double], _ key: String? = nil) {
+            var e: [String: Any] = ["type": type, "t": t, "x": box[0] + box[2]/2, "y": box[1] + box[3]/2, "bbox": box,
+                                    "source": "in_process_product_action"]
+            if let key { e["key"] = key }
+            events.append(e)
+        }
+        event("move", 0, fieldBox)
+        for i in 0..<count {
+            let t = Double(i) / Double(fps)
+            if i == 18 || i == 96 {
+                event("move", t, fieldBox); event("down", t, fieldBox); event("up", t + 0.01, fieldBox)
+                search.focusSearch(nil)
+                if i == 96 { search.setQuery("") }
+            }
+            if (24..<42).contains(i), i % 3 == 0 {
+                let text = String("readme".prefix((i - 24)/3 + 1))
+                search.setQuery(text); event("key", t, fieldBox, String(text.suffix(1)))
+            }
+            if i == 66 {
+                event("key", t, fieldBox, "ArrowDown")
+                search.moveSelectionForTesting(by: 1)
+            }
+            if (102..<138).contains(i), i % 3 == 0 {
+                let text = String("nested notes".prefix((i - 102)/3 + 1))
+                search.setQuery(text); event("key", t, fieldBox, String(text.suffix(1)))
+            }
+            if i == 174 {
+                NSApp.appearance = NSAppearance(named: .darkAqua); search.window?.appearance = NSApp.appearance
+            }
+            if i == 60 || i == 156 {
+                facts.append(["t": t, "query": search.queryForTesting, "rows": search.rowNamesForTesting(limit: 10),
+                              "status": search.refreshStatusForTesting().status])
+            }
+            if search.window?.isVisible == true { exit(1) }
+            try? search.writeSnapshot(to: frames.appendingPathComponent(String(format: "%04d.png", i)))
+            let delay = started + Double(i + 1)/Double(fps) - ProcessInfo.processInfo.systemUptime
+            if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1e9)) }
+        }
+        let report: [String: Any] = ["fps": fps, "frames": count, "duration": Double(count)/Double(fps),
+            "elapsed": ProcessInfo.processInfo.systemUptime - started, "events": events, "facts": facts,
+            "point_size": [1000, 600], "activation_policy": "prohibited", "visible": false,
+            "method": "continuous native NSView frames; isolated fixture; direct product actions; no system input"]
+        do { try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+            .write(to: outDir.appendingPathComponent("capture.json")) } catch { exit(1) }
+        Self.cleanupFixture()
+        exit(0)
+    }
 
     private func mark(_ name: String) {
         Self.progress.lock(); Self.step = name; Self.progress.unlock()
@@ -149,6 +220,11 @@ final class UISelfTest {
         mark("query")
         let readme = await query("readme")
         check("query_rows", readme.count >= 2 && Set(readme).isSuperset(of: ["README.md", "readme-notes.txt"]), readme)
+        let expanded = await query("nested notes")
+        let expandedStatus = search.refreshStatusForTesting().status
+        check("loosened_query_status", expanded == ["readme-notes.txt"] && expandedStatus.contains("Expanded folder query: (nested|*nested*/**) (notes|*notes*/**)"), expandedStatus)
+        _ = await query("readme")
+        check("strict_query_clears_loosened_status", !search.refreshStatusForTesting().status.contains("Expanded folder query:"))
         let sorted = await query("sortcase")
         check("query_fixture_rows", sorted.count == 3 && Set(sorted) == ["sortcase-alpha.dat", "sortcase-beta.dat", "sortcase-gamma.dat"], sorted)
         check("first_row_selected", search.selectedRowForTesting == 0, search.selectedRowForTesting)
@@ -186,15 +262,29 @@ final class UISelfTest {
 
         mark("folder")
         let allReadme = await query("readme")
-        search.toggleFolderScope(nil)
-        search.setFolderForTesting("nested")
+        search.restoreSavedSearch(["query":"readme","folder":"nested","caseInsensitive":"true"])
         let scoped = await settled()
-        check("folder_scope_limits_results", search.folderVisibleForTesting && scoped == ["readme-notes.txt"]
+        check("legacy_folder_scope_uses_single_query", !search.folderVisibleForTesting && search.queryForTesting.contains("nested") && scoped == ["readme-notes.txt"]
               && allReadme.count > scoped.count, ["all": allReadme, "in_nested": scoped])
-        search.setFolderForTesting("")
-        search.toggleFolderScope(nil)
-        let unscoped = await settled()
-        check("folder_scope_hidden_restores", !search.folderVisibleForTesting && unscoped.count == allReadme.count, unscoped)
+        let unscoped = await query("readme")
+        check("single_query_restores_unscoped_results", !search.folderVisibleForTesting && unscoped.count == allReadme.count, unscoped)
+
+        let beforeRows = search.cachedVisibleRowsForTesting
+        let beforeReloads = search.resultReloadsForTesting
+        let beforeSelected = search.selectedRowForTesting
+        let beforeFrame = search.window!.frame
+        var blank = false
+        for _ in 0..<8 {
+            search.refreshResultsForTesting()
+            while !search.searchSettledForTesting {
+                if search.cachedVisibleRowsForTesting != beforeRows { blank = true }
+                try? await Task.sleep(nanoseconds: 1_000_000)
+            }
+        }
+        check("background_refresh_never_blanks_or_reloads_unchanged_rows", !blank && !beforeRows.isEmpty
+              && search.cachedVisibleRowsForTesting == beforeRows && search.resultReloadsForTesting == beforeReloads
+              && search.selectedRowForTesting == beforeSelected && search.window!.frame == beforeFrame,
+              ["reloads":search.resultReloadsForTesting-beforeReloads,"blank":blank])
 
         mark("ignore")
         let ignored = await query("secret")
@@ -253,6 +343,10 @@ final class UISelfTest {
         let settings = SettingsWindowController(engine: engine, hotkey: hotkey)
         let s = settings.stateForTesting()
         check("settings_built_offscreen", settings.window?.contentView != nil && settings.window?.isVisible == false)
+        settings.showSystemSettings()
+        let layoutPasses = settings.layoutPassesForTesting
+        for _ in 0..<5 { settings.showSystemSettings() }
+        check("unchanged_settings_skip_layout", settings.layoutPassesForTesting == layoutPasses)
         check("settings_ignore_list", s.ignore.contains { $0.hasSuffix("/.hidden") } && !s.root.isEmpty,
               ["root": s.root, "ignore": s.ignore])
         check("settings_hotkey_recorder", s.recorderInWindow && !s.recorderTitle.isEmpty, s.recorderTitle)
@@ -273,7 +367,20 @@ final class UISelfTest {
             let searchURL = outDir.appendingPathComponent("search-\(mode).png")
             let settingsURL = outDir.appendingPathComponent("settings-\(mode).png")
             try? search.writeSnapshot(to: searchURL)
-            if let window = settings.window { Self.render(window, to: settingsURL) }
+            try? settings.writeSnapshot(to:settingsURL)
+            for tab in 1...4 {
+                settings.selectTabForTesting(tab)
+                let tabURL = outDir.appendingPathComponent("settings-tab\(tab)-\(mode).png")
+                try? settings.writeSnapshot(to:tabURL)
+                let stats = Self.imageStats(tabURL)
+                check("png_settings_tab\(tab)_\(mode)",stats.map{$0.distinct >= 8 && $0.stddev > 0.02} ?? false)
+                screenshots.append(tabURL.path)
+            }
+            settings.selectTabForTesting(0)
+            let updateURL = outDir.appendingPathComponent("settings-updates-\(mode).png")
+            try? settings.writeSnapshot(to:updateURL,showUpdates:true)
+            check("png_updates_\(mode)",Self.imageStats(updateURL).map{$0.width >= 1000 && $0.distinct >= 8 && $0.stddev > 0.02} ?? false)
+            screenshots.append(updateURL.path)
             for url in [searchURL, settingsURL] {
                 let stats = Self.imageStats(url)
                 let key = url.deletingPathExtension().lastPathComponent

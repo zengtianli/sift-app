@@ -16,6 +16,7 @@ final class ResultModel {
 
     /// Called on the main thread with the row range that just arrived.
     var onRowsLoaded: ((Range<Int>) -> Void)?
+    var onResultsInvalidated: (() -> Void)?
 
     init(engine: Engine) {
         self.engine = engine
@@ -23,17 +24,49 @@ final class ResultModel {
 
     var count: Int { results?.count ?? 0 }
     var highlights: [String] { results?.highlights ?? [] }
+    func cachedPaths(_ indexes:IndexSet) -> Set<String> {
+        var paths = Set<String>()
+        for (page,rows) in pages { for (offset,row) in rows.enumerated() where indexes.contains(page * Self.pageSize + offset) { paths.insert(row.path) } }
+        return paths
+    }
+    func cachedRows(in range: Range<Int>) -> [FileRow] {
+        range.compactMap { index in
+            guard index < count, let rows = pages[index / Self.pageSize], index % Self.pageSize < rows.count else { return nil }
+            return rows[index % Self.pageSize]
+        }
+    }
 
-    func replace(with results: ResultSet?) {
+    func matches(_ results: ResultSet?, pages prepared: [Int: [FileRow]]) -> Bool {
+        count == (results?.count ?? 0) && highlights == (results?.highlights ?? [])
+            && prepared.allSatisfy { pages[$0.key] == $0.value }
+    }
+
+    /// Prepare the visible pages before swapping the result set, so repainting never exposes an empty cache.
+    static func prepare(_ results: ResultSet, engine: Engine, visible: Range<Int>) -> [Int: [FileRow]]? {
+        guard results.count > 0 else { return [:] }
+        let lower = min(max(0, visible.lowerBound), results.count - 1)
+        let upper = min(max(lower + 1, visible.upperBound), results.count)
+        var prepared: [Int: [FileRow]] = [:]
+        for page in (lower / pageSize)...((upper - 1) / pageSize) {
+            let start = page * pageSize
+            let rows = engine.rows(results, start: start, count: pageSize)
+            guard rows.count == min(pageSize, results.count - start) else { return nil }
+            prepared[page] = rows
+        }
+        return prepared
+    }
+
+    func replace(with results: ResultSet?, prepared: [Int: [FileRow]] = [:]) {
         self.results = results
-        pages.removeAll(keepingCapacity: true)
-        recent.removeAll(keepingCapacity: true)
+        pages = prepared
+        recent = prepared.keys.sorted()
         inFlight.removeAll()
     }
 
     /// Returns the row if its page is loaded; otherwise schedules the page and
     /// returns nil (the table shows a placeholder until `onRowsLoaded`).
     func row(at index: Int) -> FileRow? {
+        guard index >= 0 && index < count else { return nil }
         let page = index / Self.pageSize
         if let rows = pages[page] {
             touch(page)
@@ -61,6 +94,11 @@ final class ResultModel {
             let rows = engine.rows(results, start: start, count: Self.pageSize)
             DispatchQueue.main.async {
                 guard let self, self.results === results else { return }
+                guard rows.count == min(Self.pageSize, results.count - start) else {
+                    // Keep the request marked in flight until replacement: repeated drawing must not spin on stale rows.
+                    self.onResultsInvalidated?()
+                    return
+                }
                 self.inFlight.remove(page)
                 self.pages[page] = rows
                 self.touch(page)

@@ -36,7 +36,14 @@ impl Offline {
         query: Option<String>,
         case_insensitive: bool,
     ) -> Result<Vec<search_cache::SlabIndex>> {
-        let outcome = self.cache.search_query_with_options(
+        Ok(self.search_with_metadata(directory, query, case_insensitive)?.nodes.unwrap_or_default())
+    }
+
+    pub fn search_with_metadata(
+        &mut self, directory: Option<String>, query: Option<String>, case_insensitive: bool,
+    ) -> Result<crate::query::SearchOutcome> {
+        let outcome = crate::query::search(
+            &mut self.cache,
             SearchQuery {
                 directory_query: directory.filter(|s| !s.trim().is_empty()),
                 query: query.filter(|s| !s.trim().is_empty()).map(crate::query::normalize),
@@ -44,7 +51,7 @@ impl Offline {
             SearchOptions { case_insensitive },
             CancellationToken::noop(),
         )?;
-        Ok(outcome.nodes.unwrap_or_default())
+        Ok(outcome)
     }
 
     /// Same ordering as the app and the live CLI (`engine::sort_indices`).

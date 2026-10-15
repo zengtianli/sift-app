@@ -27,7 +27,9 @@ pub struct SiftEngine {
 pub struct SiftResults {
     indices: Vec<SlabIndex>,
     highlights: String,
+    loosened: Option<String>,
     micros: u64,
+    revision: u64,
 }
 
 #[repr(C)]
@@ -96,21 +98,29 @@ pub unsafe extern "C" fn sift_engine_start(support_dir: *const c_char) -> *mut S
     let dir = unsafe { opt_str(support_dir) }
         .map(PathBuf::from)
         .unwrap_or_else(Config::default_support_dir);
-    let config = Config::load(&dir).unwrap_or_else(|e| {
-        tracing::warn!("{e:#}; using defaults");
-        Config::default_in(&dir)
-    });
+    let (config, problem) = match Config::load(&dir) {
+        Ok(config) => (config, String::new()),
+        Err(e) => {
+            let message = format!("配置无法读取，已保留最后有效范围；没有有效备份时不搜索磁盘。请在设置中修复：{e:#}");
+            tracing::warn!("{message}");
+            (Config::recover(&dir), message)
+        }
+    };
     let _ = std::fs::create_dir_all(&dir);
     let engine = match Engine::try_start(config) {
         Ok(engine) => engine,
         Err(e) => { tracing::warn!("cannot start Sift: {e:#}"); return ptr::null_mut(); }
     };
+    *engine.status.configuration_error.lock().unwrap() = problem;
     // `sift quit` ends the app exactly like ⌘Q: the app maps SIGTERM to
     // NSApp.terminate, whose applicationWillTerminate saves the index.
     let service = Service::new(engine.clone(), Box::new(|| unsafe {
         kill(std::process::id() as i32, SIGTERM);
     }));
-    let server = if std::env::var_os("SIFT_READONLY").is_some() { None } else { ipc::Server::start(service.clone())
+    // No socket in a read-only run, and none where the app says so (`SIFT_NO_IPC`): the
+    // sandboxed Mac App Store build ships without the `sift` CLI, so nothing would connect.
+    let no_socket = std::env::var_os("SIFT_READONLY").is_some() || std::env::var_os("SIFT_NO_IPC").is_some();
+    let server = if no_socket { None } else { ipc::Server::start(service.clone())
         .map_err(|e| tracing::warn!("CLI socket unavailable: {e:#}"))
         .ok() };
     Box::into_raw(Box::new(SiftEngine {
@@ -158,6 +168,32 @@ pub unsafe extern "C" fn sift_engine_status(engine: *const SiftEngine, out: *mut
     };
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sift_engine_details(engine: *const SiftEngine) -> *mut c_char {
+    let Some(engine) = (unsafe { engine.as_ref() }) else { return ptr::null_mut(); };
+    to_c(&engine.service.status_json().to_string())
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sift_remote_status(support_dir: *const c_char) -> *mut c_char {
+    let directory = unsafe { opt_str(support_dir) }.map(std::path::PathBuf::from).unwrap_or_else(Config::default_support_dir);
+    let request = crate::ipc::Request { op:"status".into(),..Default::default() };
+    let value = match crate::ipc::request_within(&crate::config::socket_path_in(&directory),&request,Some(std::time::Duration::from_secs(5))) {
+        Ok(Some(value)) => value,
+        Ok(None) => serde_json::json!({"ok":true,"running":false}),
+        Err(e) => serde_json::json!({"ok":false,"error":format!("{e:#}")}),
+    };
+    to_c(&value.to_string())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sift_engine_control(engine: *const SiftEngine, json: *const c_char) -> *mut c_char {
+    let Some(engine) = (unsafe { engine.as_ref() }) else { return ptr::null_mut(); };
+    let result = unsafe { opt_str(json) }.ok_or_else(|| anyhow::anyhow!("missing control request"))
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(Into::into))
+        .and_then(|v| engine.service.control(&v));
+    to_c(&result.unwrap_or_else(|e| serde_json::json!({"ok":false,"error":format!("{e:#}")})).to_string())
+}
+
 /// Runs a search. Blocks until the index is loaded. On `SIFT_OK` returns a
 /// result set; on `SIFT_ERROR` `*error` receives a message (free it).
 ///
@@ -183,13 +219,15 @@ pub unsafe extern "C" fn sift_search(
     };
     let query = unsafe { opt_str(query) };
     let directory = unsafe { opt_str(directory) };
-    match engine.engine.search(directory, query, case_insensitive, true) {
-        Ok(Some((outcome, took))) => {
+    match engine.engine.search_versioned(directory, query, case_insensitive, true) {
+        Ok(Some((outcome, took, revision))) => {
             set_code(SIFT_OK);
             Box::into_raw(Box::new(SiftResults {
                 indices: outcome.nodes.unwrap_or_default(),
                 highlights: outcome.highlights.join("\n"),
+                loosened: outcome.loosened,
                 micros: took.as_micros() as u64,
+                revision,
             }))
         }
         Ok(None) => {
@@ -212,6 +250,13 @@ pub unsafe extern "C" fn sift_search(
 pub unsafe extern "C" fn sift_results_len(results: *const SiftResults) -> u64 {
     unsafe { results.as_ref() }.map_or(0, |r| r.indices.len() as u64)
 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sift_results_locate(engine: *const SiftEngine, results: *const SiftResults, paths_json: *const c_char) -> *mut c_char {
+    let (Some(engine), Some(results)) = (unsafe { engine.as_ref() }, unsafe { results.as_ref() }) else { return ptr::null_mut(); };
+    let paths = unsafe { opt_str(paths_json) }.and_then(|s| serde_json::from_str::<Vec<std::path::PathBuf>>(&s).ok()).unwrap_or_default();
+    if paths.is_empty() { return to_c("[]"); }
+    to_c(&serde_json::to_string(&engine.engine.locate(results.indices.clone(), paths, results.revision)).unwrap_or_else(|_| "[]".into()))
+}
 
 /// Microseconds the search took on the index thread, excluding time spent
 /// waiting for the index to load or for earlier commands.
@@ -230,6 +275,15 @@ pub unsafe extern "C" fn sift_results_micros(results: *const SiftResults) -> u64
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sift_results_highlights(results: *const SiftResults) -> *mut c_char {
     unsafe { results.as_ref() }.map_or(ptr::null_mut(), |r| to_c(&r.highlights))
+}
+
+/// Actual fallback query, or NULL for a strict search. Free with `sift_string_free`.
+///
+/// # Safety
+/// `results` must be valid or NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sift_results_loosened(results: *const SiftResults) -> *mut c_char {
+    unsafe { results.as_ref() }.and_then(|r| r.loosened.as_deref()).map_or(ptr::null_mut(), to_c)
 }
 
 /// Sorts the result set in place. Returns false when a newer search cancelled it.
@@ -252,7 +306,7 @@ pub unsafe extern "C" fn sift_results_sort(
     };
     match engine
         .engine
-        .sort(std::mem::take(&mut results.indices), key, descending, true)
+        .sort_at(std::mem::take(&mut results.indices), key, descending, true, Some(results.revision))
     {
         Some(sorted) => {
             results.indices = sorted;
@@ -285,7 +339,8 @@ pub unsafe extern "C" fn sift_results_rows(
     let len = results.indices.len();
     let start = (start as usize).min(len);
     let end = start.saturating_add(count as usize).min(len);
-    let rows = engine.engine.nodes(results.indices[start..end].to_vec());
+    let rows = engine.engine.nodes_at(results.indices[start..end].to_vec(), Some(results.revision));
+    let written = rows.len();
     for (i, node) in rows.into_iter().enumerate() {
         let row = Row::from(node);
         let path = CString::new(row.path.as_os_str().as_bytes().to_vec())
@@ -302,7 +357,7 @@ pub unsafe extern "C" fn sift_results_rows(
             });
         }
     }
-    (end - start) as u64
+    written as u64
 }
 
 /// # Safety
@@ -357,7 +412,7 @@ pub unsafe extern "C" fn sift_config_json(engine: *const SiftEngine) -> *mut c_c
     let Some(engine) = (unsafe { engine.as_ref() }) else {
         return ptr::null_mut();
     };
-    let config = Config::load(&engine.service.support_dir()).unwrap_or_else(|_| engine.service.config());
+    let config = engine.service.config();
     to_c(&serde_json::to_string(&config).unwrap_or_default())
 }
 

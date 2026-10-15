@@ -1,6 +1,6 @@
 import AppKit
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var engine: Engine!
     private var searchWindow: SearchWindowController!
     private var settingsWindow: SettingsWindowController?
@@ -9,6 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// How often settings brought in from outside (an import, another Mac through iCloud) were re-read.
     private var lifecycleReloads = 0
     private var historyObserver: NSObjectProtocol?
+    private var localHistoryObserver: NSObjectProtocol?
+    private var statusItem: NSStatusItem?
 
     static let supportDirectory: URL = {
         if let override = ProcessInfo.processInfo.environment["SIFT_SUPPORT_DIR"], !override.isEmpty {
@@ -23,6 +25,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if CommandLine.arguments.contains("--ui-self-test") { UISelfTest.prepareEnvironment() }
         else if Prefs.laneQuiet { UISelfTest.prepareEnvironment(settle: false) }
         if Prefs.readOnly { setenv("SIFT_READONLY", "1", 1) } // snapshot runs never write the index
+        #if APP_STORE
+        // The sandboxed build indexes the folder the user granted: its scope is opened and config.json's root is
+        // made that folder before the engine reads either.
+        IndexAccess.prepare(supportDirectory: Self.supportDirectory)
+        #endif
         guard let started = Engine(supportDirectory: Self.supportDirectory) else {
             NSApp.terminate(nil)
             return
@@ -30,12 +37,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         engine = started
         searchWindow = SearchWindowController(engine: engine)
         hotkey = GlobalHotkey { [weak self] in self?.searchWindow.toggle() }
+        SiftShortcuts.shared.primary = hotkey
+        SiftShortcuts.shared.perform = { [weak self] id in self?.performShortcut(id) }
         // No system-wide shortcut until the user records one in Settings.
         if !Prefs.headless, !Prefs.readOnly, let combo = AppSettings.hotkey { hotkey.register(combo) }
         // `sift trash`, `sift hotkey …`, `sift login-item …`: done here by the window's own functions. A snapshot or
         // self-test run has no CLI socket (SIFT_READONLY), so nothing can reach them there.
         AppActions.install(engine: engine, hotkey: hotkey, search: searchWindow, settings: { [weak self] in self?.settingsWindow })
         if !Prefs.headless, !Prefs.readOnly, let store = Lifecycle.store() { installLifecycle(store) }
+        #if APP_STORE
+        // An isolated verification run answers for the open panel (IndexAccess.testGrantVariable): the folder is
+        // granted to the running engine exactly as the panel's answer is.
+        if !Prefs.readOnly, let folder = IndexAccess.testGrant {
+            DispatchQueue.main.async { [engine] in
+                if let engine, let error = IndexAccess.grant(folder, engine: engine) { fputs("store access: \(error)\n", stderr) }
+            }
+        }
+        #else
         // `sift history clear --yes` (core/src/bin/sift.rs, prefs::clear_recent_searches) names this app's own
         // preference domain, so a test run on another domain never reaches the owner's window.
         if !Prefs.headless, !Prefs.readOnly, let domain = Bundle.main.bundleIdentifier {
@@ -43,7 +61,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 forName: Notification.Name("cyou.tianli.sift.recent-searches-cleared." + domain), object: nil, queue: .main
             ) { [weak self] _ in self?.searchWindow.clearRecentSearches() }
         }
+        #endif
         NSApp.mainMenu = buildMenu()
+        if !Prefs.readOnly, !Prefs.headless { SiftShortcuts.shared.reload();updateMenuBar() }
+        localHistoryObserver = NotificationCenter.default.addObserver(forName:.init("SiftClearHistory"),object:nil,queue:.main) { [weak self] _ in self?.searchWindow.clearRecentSearches() }
         let args = ProcessInfo.processInfo.arguments
         if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
             runSnapshot(to: URL(fileURLWithPath: args[i + 1]), args: args)
@@ -53,12 +74,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             UISelfTest.start(engine: engine, searchWindow: searchWindow, hotkey: hotkey, args: args)
             return
         }
+        #if !APP_STORE
         if Prefs.lifecycleSelfTest {
             LifecycleSelfTest.start(engine: engine, searchWindow: searchWindow, hotkey: hotkey, configuration: configuration,
                                     reloads: { [weak self] in self?.lifecycleReloads ?? 0 },
                                     settings: { [weak self] in self?.settingsWindowUnshown() })
             return
         }
+        #endif
         if Prefs.laneQuiet {
             searchWindow.prepareOffscreen(size: NSSize(width: 1000, height: 600))
             announceLaneReady()
@@ -98,9 +121,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // it already has: a rewrite of an unchanged config.json could land on top of a command's next import.
             let index: ([String: Any]?) -> [String: Any]? = { $0?.filter { $0.key.hasPrefix("file.") } }
             let indexChanged = !Lifecycle.same(index(stored), index(applied))
-            self.hotkey.unregister()
-            if let combo = AppSettings.hotkey { self.hotkey.register(combo) }
+            let previousShortcut = self.hotkey.combo
+            if let combo = AppSettings.hotkey {
+                if !self.hotkey.register(combo) {
+                    AppSettings.hotkey = previousShortcut
+                    self.searchWindow.reportConfigurationError("导入的快捷键被占用，原绑定保留。")
+                }
+            } else { self.hotkey.unregister() }
             self.searchWindow.reloadConfiguration()
+            #if APP_STORE
+            // Whatever arrived, the index root stays the folder granted on this Mac (the root is not among this
+            // build's portable settings; this also covers a config.json written by hand or by an older build).
+            IndexAccess.enforceRoot(in: file)
+            #endif
             if indexChanged, let data = try? Data(contentsOf: file) {
                 let previous = self.engine.settingsJSON()
                 if let error = self.engine.updateSettings(data) {
@@ -108,16 +141,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.searchWindow.reportConfigurationError("配置未应用，保留原索引范围：" + error)
                 }
             }
-            self.settingsWindow = nil
+            if let data = try? Data(contentsOf: store.supportDirectory.appendingPathComponent("runtime.json")),
+               let runtime = (try? JSONSerialization.jsonObject(with:data)) as? [String:Any] {
+                var request:[String:Any] = ["action":"set"]
+                for key in ["auto_repair","auto_snapshot"] { if let value = runtime[key] as? Bool { request[key] = value } }
+                _ = self.engine.control(request)
+            }
+            self.settingsWindow?.reloadConfiguration()
+            SiftShortcuts.shared.reload()
+            self.updateMenuBar()
             // After the engine saved its normalized copy, so that rewrite is not taken for another change.
             applied = Lifecycle.storedValues(config)
             self.lifecycleReloads += 1
         }
         configuration = config
+        #if APP_STORE
+        // No「配置与更新…」window in the Mac App Store build: the App Store delivers its updates. The settings still
+        // travel: Settings has the iCloud switch and Export / Import (StoreConfiguration), on this same object.
+        config.start()
+        StoreConfiguration.current = config
+        #else
+        let settings = settingsWindowUnshown()
+        AppLifecycleUI.shared.productGroups = { [weak settings] in settings?.groups() ?? [] }
+        AppLifecycleUI.shared.willShow = { [weak settings] in settings?.showSystemSettings() }
+        AppLifecycleUI.shared.canInstallUpdate = { [weak self] in
+            guard let self else { return false };let d = self.engine.details()
+            return Lifecycle.installable(d)
+        }
         AppLifecycleUI.install(name: Lifecycle.name, configuration: config, updateSource: Lifecycle.updateSource)
         // `sift config sync` and `sift config import` run in another process. The running window follows them (the
         // switch, the status line, the imported settings); the command stays the only writer of the switch.
         AppLifecycleCLI.follow(config)
+        #endif
     }
 
     /// `-lane_quiet YES`: the window is built and laid out but never shown. Ready is logged once the index
@@ -169,6 +224,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 do { try self.searchWindow.writeSnapshot(to: url) } catch { fputs("\(error)\n", stderr) }
+                #if APP_STORE
+                // The sandboxed build can only write the picture inside its container; the same facts as text.
+                let shown = self.searchWindow.refreshStatusForTesting()
+                fputs("snapshot: results=\(self.searchWindow.resultCountForTesting) rows=\(self.searchWindow.rowNamesForTesting(limit: 5))"
+                      + " status=\"\(shown.status)\" count=\"\(shown.count)\" state=\(shown.state)\n", stderr)
+                #endif
                 exit(0)
             }
             timer.invalidate()
@@ -207,11 +268,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func settingsWindowUnshown() -> SettingsWindowController {
         if let settingsWindow { return settingsWindow }
         let window = SettingsWindowController(engine: engine, hotkey: hotkey)
+        window.onSelectQuery = { [weak self] query in self?.searchWindow.setQuery(query);self?.searchWindow.show() }
+        window.onSelectSaved = { [weak self] saved in self?.searchWindow.restoreSavedSearch(saved);self?.searchWindow.show() }
+        window.onPreferencesChange = { [weak self] in self?.updateMenuBar() }
+        window.onSaveCurrentSearch = { [weak self] parent in self?.searchWindow.saveCurrentSearch(parent) }
+        #if APP_STORE
+        window.onIndexFolderChange = { [weak self] in self?.searchWindow.indexFolderChanged($0) }
+        #endif
         settingsWindow = window
         return window
     }
 
     @objc func showSearch(_ sender: Any?) { searchWindow.show() }
+    @objc func showHelp(_ sender: Any?) { settingsWindowUnshown().showHelp() }
+    @objc private func toggleIndex(_ sender:Any?) {
+        let paused = engine.details()["paused"] as? Bool == true
+        _ = engine.control(["action":paused ? "resume" : "pause"])
+        settingsWindow?.showSystemSettings();updateMenuBar()
+    }
+    private func updateMenuBar() {
+        guard !Prefs.readOnly,!Prefs.headless,!Prefs.lifecycleSelfTest else { return }
+        guard UserDefaults.standard.bool(forKey:"menuBar") else {
+            if let item = statusItem { NSStatusBar.system.removeStatusItem(item) };statusItem = nil;return
+        }
+        if statusItem == nil { statusItem = NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength);statusItem?.button?.image = NSImage(systemSymbolName:"magnifyingglass",accessibilityDescription:"Sift") }
+        let menu = statusItem?.menu ?? NSMenu()
+        menu.delegate = self;refreshStatusMenu(menu);statusItem?.menu = menu
+    }
+    func menuNeedsUpdate(_ menu:NSMenu) {
+        if menu === statusItem?.menu { refreshStatusMenu(menu) }
+    }
+    private func refreshStatusMenu(_ menu:NSMenu) {
+        menu.removeAllItems()
+        let details = engine.details()
+        let state = item(SiftDiagnostics.summary(details),nil);state.isEnabled = false;menu.addItem(state)
+        menu.addItem(item("打开 Sift",#selector(showSearch(_:)),target:self))
+        menu.addItem(item(details["paused"] as? Bool == true ? "恢复索引" : "暂停索引",#selector(toggleIndex(_:)),target:self))
+        menu.addItem(item("设置…",#selector(showSettings(_:)),target:self))
+        #if !APP_STORE
+        AppLifecycleUI.menuItems().forEach{menu.addItem($0)}
+        #endif
+        menu.addItem(.separator());menu.addItem(item("退出 Sift",#selector(NSApplication.terminate(_:)),"q"))
+    }
+    private func performShortcut(_ id:String) {
+        if id == "show" { searchWindow.toggle();return }
+        guard let action = ShortcutAction.all.first(where:{$0.id == id}) else { return }
+        if action.fileAction, searchWindow.focusForTesting != "table" || searchWindow.window?.isKeyWindow != true || !NSApp.isActive { NSSound.beep();return }
+        if !action.fileAction && id != "settings" && id != "help" { searchWindow.show() }
+        let menuItem = NSMenuItem(title:action.title,action:NSSelectorFromString(action.selector),keyEquivalent:"");menuItem.tag = action.tag
+        if id == "settings" { showSettings(nil) } else if id == "help" { showHelp(nil) }
+        else { _ = searchWindow.perform(NSSelectorFromString(action.selector),with:menuItem) }
+    }
 
     // MARK: Menu
 
@@ -232,7 +339,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         app.addItem(item("About Sift", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), ""))
         app.addItem(.separator())
         app.addItem(item("Settings…", #selector(showSettings(_:)), ",", target: self))
+        #if !APP_STORE
         for item in AppLifecycleUI.menuItems() { app.addItem(item) }
+        #endif
         app.addItem(.separator())
         app.addItem(item("Hide Sift", #selector(NSApplication.hide(_:)), "h"))
         app.addItem(item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]))
@@ -243,6 +352,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let file = NSMenu(title: "File")
         file.addItem(item("Open", #selector(SearchWindowController.openSelection(_:)), "o", target: sw))
         file.addItem(item("Show in Finder", #selector(SearchWindowController.revealSelection(_:)), "r", target: sw))
+        file.addItem(item("用其他应用打开…",#selector(SearchWindowController.openWithSelection(_:)),target:sw))
+        file.addItem(item("文件信息",#selector(SearchWindowController.showFileInfo(_:)),target:sw))
+        file.addItem(item("重命名…",#selector(SearchWindowController.renameSelection(_:)),target:sw))
         // Space previews (list only); no menu key, so Space in the search field stays a space.
         file.addItem(item("Quick Look", #selector(SearchWindowController.toggleQuickLook(_:)), "", [], target: sw))
         file.addItem(.separator())
@@ -269,8 +381,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         search.addItem(item("Focus Search Field", #selector(SearchWindowController.focusSearch(_:)), "l", target: sw))
         // ⌘Y opens history, as in Safari and Chrome.
         search.addItem(item("Recent Searches", #selector(SearchWindowController.showHistory(_:)), "y", target: sw))
+        search.addItem(item("常用搜索",#selector(SearchWindowController.showSavedSearches(_:)),target:sw))
+        search.addItem(item("保存当前搜索…",#selector(SearchWindowController.saveCurrentSearch(_:)),target:sw))
+        search.addItem(item("导出搜索结果…",#selector(SearchWindowController.exportResults(_:)),target:sw))
         search.addItem(.separator())
-        search.addItem(item("Limit to Folders", #selector(SearchWindowController.toggleFolderScope(_:)), "d", target: sw))
         search.addItem(item("Match Case", #selector(SearchWindowController.toggleCase(_:)), "i", target: sw))
         search.addItem(.separator())
         let sorts: [(String, SortKey)] = [("Sort by Name", .name), ("Sort by Folder", .path),
@@ -282,17 +396,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         search.addItem(.separator())
         search.addItem(item("Re-index Everything", #selector(SearchWindowController.rescan(_:)), "R", target: sw))
+        #if APP_STORE
+        search.addItem(item("Choose Folder to Index…", #selector(SearchWindowController.chooseIndexFolder(_:)), "", target: sw))
+        #endif
 
         let window = NSMenu(title: "Window")
         window.addItem(item("Search Window", #selector(showSearch(_:)), "0", target: self))
         window.addItem(item("Minimize", #selector(NSWindow.performMiniaturize(_:)), "m"))
+        window.addItem(item("缩放",#selector(NSWindow.performZoom(_:))))
         NSApp.windowsMenu = window
-
-        for menu in [app, file, edit, search, window] {
+        let help = NSMenu(title:"帮助")
+        help.addItem(item("使用指南与快捷键",#selector(showHelp(_:)),target:self))
+        NSApp.helpMenu = help
+        for menu in [app, file, edit, search, window, help] {
             let holder = NSMenuItem()
             holder.submenu = menu
             main.addItem(holder)
         }
+        SiftText.menu(main)
         return main
     }
 }

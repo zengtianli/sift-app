@@ -270,6 +270,11 @@ final class UISelfTest {
         check("single_query_restores_unscoped_results", !search.folderVisibleForTesting && unscoped.count == allReadme.count, unscoped)
 
         let beforeRows = search.cachedVisibleRowsForTesting
+        let icons = beforeRows.map { IconCache.shared.icon(for: $0) }
+        check("row_icons_retain_only_small_retina_bitmaps", !icons.isEmpty && icons.allSatisfy {
+            $0.size == NSSize(width: 16, height: 16) && !$0.representations.isEmpty
+                && $0.representations.allSatisfy { $0.pixelsWide == 32 && $0.pixelsHigh == 32 }
+        }, icons.map { $0.representations.map { [$0.pixelsWide, $0.pixelsHigh] } })
         let beforeReloads = search.resultReloadsForTesting
         let beforeSelected = search.selectedRowForTesting
         let beforeFrame = search.window!.frame

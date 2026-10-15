@@ -49,10 +49,27 @@ final class IconCache {
 
     private init() {
         cache.countLimit = 400
-        folder = NSWorkspace.shared.icon(for: .folder)
-        generic = NSWorkspace.shared.icon(for: .data)
-        folder.size = NSSize(width: 16, height: 16)
-        generic.size = NSSize(width: 16, height: 16)
+        cache.totalCostLimit = 2 * 1024 * 1024
+        folder = Self.smallIcon(NSWorkspace.shared.icon(for: .folder))
+        generic = Self.smallIcon(NSWorkspace.shared.icon(for: .data))
+    }
+
+    /// Rows show 16-point icons. Retaining the system image also retains its
+    /// large representations; store only a concrete 32-pixel Retina bitmap.
+    private static func smallIcon(_ source: NSImage) -> NSImage {
+        let image = NSImage(size: NSSize(width: 16, height: 16))
+        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 32, pixelsHigh: 32,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 128, bitsPerPixel: 32),
+            let context = NSGraphicsContext(bitmapImageRep: bitmap) else { return source }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        source.draw(in: NSRect(x: 0, y: 0, width: 32, height: 32), from: .zero,
+                    operation: .copy, fraction: 1)
+        NSGraphicsContext.restoreGraphicsState()
+        bitmap.size = image.size
+        image.addRepresentation(bitmap)
+        return image
     }
 
     func icon(for row: FileRow) -> NSImage {
@@ -61,16 +78,15 @@ final class IconCache {
         let perPath = row.isDirectory || ext == "app"
         let key = (perPath ? row.path : "ext:" + ext) as NSString
         if let hit = cache.object(forKey: key) { return hit }
-        let image: NSImage
-        if perPath {
-            image = NSWorkspace.shared.icon(forFile: row.path)
-        } else if let type = UTType(filenameExtension: ext) {
-            image = NSWorkspace.shared.icon(for: type)
-        } else {
+        let image: NSImage = autoreleasepool {
+            if perPath {
+                return Self.smallIcon(NSWorkspace.shared.icon(forFile: row.path))
+            } else if let type = UTType(filenameExtension: ext) {
+                return Self.smallIcon(NSWorkspace.shared.icon(for: type))
+            }
             return generic
         }
-        image.size = NSSize(width: 16, height: 16)
-        cache.setObject(image, forKey: key)
+        cache.setObject(image, forKey: key, cost: 32 * 32 * 4)
         return image
     }
 }

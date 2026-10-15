@@ -208,6 +208,26 @@ pub unsafe extern "C" fn sift_search(
     code: *mut i32,
     error: *mut *mut c_char,
 ) -> *mut SiftResults {
+    unsafe { search_with_activity(engine, query, directory, case_insensitive, code, error, true) }
+}
+
+/// Same query/cancellation semantics as sift_search, without recording user
+/// activity. For automatic result refreshes only.
+///
+/// # Safety
+/// Same pointer requirements as sift_search.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sift_search_refresh(
+    engine: *const SiftEngine, query: *const c_char, directory: *const c_char,
+    case_insensitive: bool, code: *mut i32, error: *mut *mut c_char,
+) -> *mut SiftResults {
+    unsafe { search_with_activity(engine, query, directory, case_insensitive, code, error, false) }
+}
+
+unsafe fn search_with_activity(
+    engine: *const SiftEngine, query: *const c_char, directory: *const c_char,
+    case_insensitive: bool, code: *mut i32, error: *mut *mut c_char, user_initiated: bool,
+) -> *mut SiftResults {
     let set_code = |c: i32| {
         if let Some(code) = unsafe { code.as_mut() } {
             *code = c;
@@ -219,7 +239,7 @@ pub unsafe extern "C" fn sift_search(
     };
     let query = unsafe { opt_str(query) };
     let directory = unsafe { opt_str(directory) };
-    match engine.engine.search_versioned(directory, query, case_insensitive, true) {
+    match engine.engine.search_versioned_with_activity(directory, query, case_insensitive, true, user_initiated) {
         Ok(Some((outcome, took, revision))) => {
             set_code(SIFT_OK);
             Box::into_raw(Box::new(SiftResults {

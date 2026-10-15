@@ -45,6 +45,9 @@ char *sift_results_locate(const SiftEngine *engine, const SiftResults *results, 
 
 SiftResults *sift_search(const SiftEngine *engine, const char *query, const char *directory,
                          bool case_insensitive, int32_t *code, char **error);
+// Automatic refresh: same results/cancellation, does not defer idle repair/saving.
+SiftResults *sift_search_refresh(const SiftEngine *engine, const char *query, const char *directory,
+                                bool case_insensitive, int32_t *code, char **error);
 uint64_t sift_results_len(const SiftResults *results);
 // Search time on the index thread, excluding queueing and index loading.
 uint64_t sift_results_micros(const SiftResults *results);

@@ -221,6 +221,9 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
             table.autosaveTableColumns = true
         }
         table.style = .fullWidth
+        // The rows/cells can share one backing surface. Keeping a separate
+        // Core Animation layer for every text and icon retains large GPU buffers.
+        table.canDrawSubviewsIntoLayer = true
         table.rowHeight = 24
         table.usesAlternatingRowBackgroundColors = true
         table.allowsMultipleSelection = true
@@ -611,7 +614,7 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
         let paths = preserveSelection ? selectionPaths : []
         let all = preserveSelection && model.count > 0 && table.numberOfSelectedRows == model.count
         DispatchQueue.global(qos: .userInteractive).async { [engine, weak self] in
-            let outcome = engine.search(query: query, folder: folder.isEmpty ? nil : folder, caseInsensitive: ci)
+            let outcome = engine.search(query: query, folder: folder.isEmpty ? nil : folder, caseInsensitive: ci, background: preserveSelection)
             // Report work time, not wall time: a search typed during launch waits
             // for the index to load, and that wait is not the search's cost.
             var millis = 0.0

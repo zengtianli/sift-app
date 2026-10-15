@@ -186,6 +186,7 @@ enum Cmd {
         query: SearchQuery,
         options: SearchOptions,
         token: CancellationToken,
+        user_initiated: bool,
         /// The outcome and the time the search itself took (not time spent queued).
         reply: Sender<Result<(SearchOutcome, Duration, u64)>>,
     },
@@ -309,6 +310,15 @@ impl Engine {
     pub fn search_versioned(
         &self, directory: Option<String>, query: Option<String>, case_insensitive: bool, interactive: bool,
     ) -> Result<Option<(SearchOutcome, Duration, u64)>> {
+        self.search_versioned_with_activity(directory, query, case_insensitive, interactive, true)
+    }
+
+    /// Automatic GUI result refreshes use the same query/cancellation path, but
+    /// must not defer idle repair or snapshots as if the owner had typed again.
+    pub(crate) fn search_versioned_with_activity(
+        &self, directory: Option<String>, query: Option<String>, case_insensitive: bool,
+        interactive: bool, user_initiated: bool,
+    ) -> Result<Option<(SearchOutcome, Duration, u64)>> {
         let token = token(interactive);
         let (reply, rx) = bounded(1);
         self.send(Cmd::Search {
@@ -318,6 +328,7 @@ impl Engine {
             },
             options: SearchOptions { case_insensitive },
             token,
+            user_initiated,
             reply,
         })?;
         let (outcome, took, revision) = rx.recv()??;
@@ -714,9 +725,10 @@ impl Loop {
                 query,
                 options,
                 token,
+                user_initiated,
                 reply,
             } => {
-                self.last_activity = Instant::now();
+                if user_initiated { self.last_activity = Instant::now(); }
                 let started = Instant::now();
                 let outcome = crate::query::search(&mut self.cache, query, options, token);
                 let revision = self.status.index_revision.load(Ordering::Relaxed);
@@ -745,7 +757,8 @@ impl Loop {
                 token,
                 reply,
             } => {
-                self.last_activity = Instant::now();
+                // The preceding user search already records activity. Sorting
+                // an automatic refresh must not keep idle repair postponed.
                 let current = self.status.index_revision.load(Ordering::Relaxed);
                 let sorted = if revision.is_none_or(|r| r == current) { self.sort(indices, key, descending, token) } else { None };
                 let _ = reply.send(sorted);
@@ -1191,7 +1204,34 @@ mod rebuild_tests {
         std::fs::write(&late, "y").unwrap();
         assert!(state.cache.node_index_for_path(&late).is_none());
 
-        state.repair = Some(Repair::start(config));
+        status.auto_repair.store(true, Ordering::Relaxed);
+        let old_activity = Instant::now() - Duration::from_secs(90);
+        state.last_activity = old_activity;
+        let command = |user_initiated, reply| Cmd::Search {
+            query: SearchQuery { directory_query: None, query: Some("kept".into()) },
+            options: SearchOptions { case_insensitive: false }, token: token(false), user_initiated, reply,
+        };
+        let (reply, rx) = bounded(1);
+        state.handle(command(true, reply));
+        let _ = rx.recv().unwrap().unwrap();
+        assert!(state.last_activity > old_activity);
+        state.maybe_recover();
+        assert!(state.repair.is_none(), "a user search still postpones repair");
+
+        state.last_activity = old_activity;
+        state.recovery = RecoverySchedule::default();
+        state.recovery.due(Instant::now() - Duration::from_secs(31), true, Duration::from_secs(90), None);
+        let (reply, rx) = bounded(1);
+        state.handle(command(false, reply));
+        let (outcome, _, revision) = rx.recv().unwrap().unwrap();
+        let (reply, rx) = bounded(1);
+        state.handle(Cmd::Sort { indices: outcome.nodes.unwrap(), revision: Some(revision),
+            key: SortKey::Name, descending: false, token: token(false), reply });
+        assert!(rx.recv().unwrap().is_some());
+        assert_eq!(state.last_activity, old_activity, "automatic refresh and sort are not user activity");
+        state.host = HostLoad::default(); // unknown first host sample permits repair
+        state.maybe_recover();
+        assert!(state.repair.is_some(), "background refresh cannot starve idle repair");
         let cache = state.repair.as_ref().unwrap().done.recv_timeout(Duration::from_secs(30)).unwrap();
         assert!(cache.as_ref().is_some_and(|c| c.node_index_for_path(&late).is_some()));
         // Until the swap the loop still answers from the old snapshot.

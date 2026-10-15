@@ -130,16 +130,17 @@ final class Engine {
         return (try? JSONSerialization.jsonObject(with: Data(String(cString: text).utf8))) as? [String: Any] ?? ["ok": false]
     }
 
-    func search(query: String, folder: String?, caseInsensitive: Bool) -> SearchOutcome {
+    func search(query: String, folder: String?, caseInsensitive: Bool, background: Bool = false) -> SearchOutcome {
         var code: Int32 = 0
         var error: UnsafeMutablePointer<CChar>?
+        let search = background ? sift_search_refresh : sift_search
         let result: OpaquePointer? = query.withCString { q in
             if let folder, !folder.isEmpty {
                 return folder.withCString { f in
-                    sift_search(raw, q, f, caseInsensitive, &code, &error)
+                    search(raw, q, f, caseInsensitive, &code, &error)
                 }
             }
-            return sift_search(raw, q, nil, caseInsensitive, &code, &error)
+            return search(raw, q, nil, caseInsensitive, &code, &error)
         }
         switch code {
         case 0:

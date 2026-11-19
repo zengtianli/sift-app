@@ -22,6 +22,10 @@ final class UISelfTest {
     private var checks: [(String, Bool)] = []
     private var details: [String: Any] = [:]
     private var screenshots: [String] = []
+    /// Only populated by the explicitly isolated bilingual acceptance entry. Values are read
+    /// from the real AppKit controls; user-entered text is never treated as product copy.
+    private var localizationSurfaces: [String: [[String: String]]] = [:]
+    private var localizationShared: [[String: String]] = []
     nonisolated private static let progress = NSLock()
     nonisolated(unsafe) private static var step = "start"
 
@@ -51,6 +55,11 @@ final class UISelfTest {
         let config: [String: Any] = ["root": root.path, "ignore_paths": [root.appendingPathComponent(".hidden").path], "include_paths": []]
         try? JSONSerialization.data(withJSONObject: config).write(to: support.appendingPathComponent("config.json"))
         setenv("SIFT_SUPPORT_DIR", support.path, 1)
+        #if APP_STORE
+        if Bundle.main.bundleIdentifier?.hasPrefix(Lifecycle.isolatedBundlePrefix) == true {
+            setenv(IndexAccess.testGrantVariable,root.path,1)
+        }
+        #endif
         tempFixture = base
         // Let the fixture's own file events age past the engine's FSEvents start: files created
         // milliseconds before the first walk were otherwise indexed twice (walk + replayed create).
@@ -99,20 +108,27 @@ final class UISelfTest {
         mark("demo capture")
         guard Prefs.readOnly, NSApp.activationPolicy() == .prohibited,
               await waitUntil(20, { engine.status().state == .ready }) else { exit(1) }
-        search.prepareOffscreen(size: NSSize(width: 1000, height: 600))
+        #if APP_STORE
+        let pointSize = NSSize(width:1280,height:800)
+        let frameCount = 336
+        #else
+        let pointSize = NSSize(width:1000,height:600)
+        let frameCount = 216
+        #endif
+        search.prepareOffscreen(size:pointSize)
         if !search.caseInsensitiveForTesting { search.toggleCase(nil) }
         NSApp.appearance = NSAppearance(named: .aqua)
         search.window?.appearance = NSApp.appearance
         search.setQuery("")
         let frames = outDir.appendingPathComponent("frames")
         try? FileManager.default.createDirectory(at: frames, withIntermediateDirectories: true)
-        let fps = 12, count = 216
+        let fps = 12, count = frameCount
         var events: [[String: Any]] = []
         var facts: [[String: Any]] = []
         let started = ProcessInfo.processInfo.systemUptime
         let field = search.searchFieldForTesting
         let rect = field.convert(field.bounds, to: search.window!.contentView!)
-        let fieldBox: [Double] = [Double(rect.minX), Double(600 - rect.maxY), Double(rect.width), Double(rect.height)]
+        let fieldBox: [Double] = [Double(rect.minX), Double(pointSize.height - rect.maxY), Double(rect.width), Double(rect.height)]
         func event(_ type: String, _ t: Double, _ box: [Double], _ key: String? = nil) {
             var e: [String: Any] = ["type": type, "t": t, "x": box[0] + box[2]/2, "y": box[1] + box[3]/2, "bbox": box,
                                     "source": "in_process_product_action"]
@@ -142,6 +158,23 @@ final class UISelfTest {
             if i == 174 {
                 NSApp.appearance = NSAppearance(named: .darkAqua); search.window?.appearance = NSApp.appearance
             }
+            #if APP_STORE
+            if i == 216 {
+                NSApp.appearance = NSAppearance(named:.aqua);search.window?.appearance = NSApp.appearance
+                search.setQuery("alpha")
+                event("key",t,fieldBox,"alpha")
+            }
+            if i == 252 {
+                let filter = search.typeFilterFrameForTesting
+                let box = [Double(filter.minX),Double(pointSize.height - filter.maxY),Double(filter.width),Double(filter.height)]
+                event("move",t,box);event("down",t,box);event("up",t + 0.01,box)
+                search.applyFiltersForTesting(type:1,date:0,size:0)
+            }
+            if i == 300 {
+                facts.append(["t":t,"query":search.queryForTesting,"rows":search.rowNamesForTesting(limit:10),
+                              "status":search.refreshStatusForTesting().status,"filter":"PDF"])
+            }
+            #endif
             if i == 60 || i == 156 {
                 facts.append(["t": t, "query": search.queryForTesting, "rows": search.rowNamesForTesting(limit: 10),
                               "status": search.refreshStatusForTesting().status])
@@ -153,7 +186,7 @@ final class UISelfTest {
         }
         let report: [String: Any] = ["fps": fps, "frames": count, "duration": Double(count)/Double(fps),
             "elapsed": ProcessInfo.processInfo.systemUptime - started, "events": events, "facts": facts,
-            "point_size": [1000, 600], "activation_policy": "prohibited", "visible": false,
+            "point_size": [Int(pointSize.width),Int(pointSize.height)], "activation_policy": "prohibited", "visible": false,
             "method": "continuous native NSView frames; isolated fixture; direct product actions; no system input"]
         do { try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
             .write(to: outDir.appendingPathComponent("capture.json")) } catch { exit(1) }
@@ -202,6 +235,129 @@ final class UISelfTest {
         return search.control(search.searchFieldForTesting, textView: editor, doCommandBy: selector)
     }
 
+    private var localizationLanguage: String? {
+        ProcessInfo.processInfo.environment["SIFT_L10N_TEST_LANGUAGE"]
+    }
+
+    /// A Chinese brand name may remain alongside the English name. Everything else in these
+    /// private fixtures is ASCII, so a Han character in a product control is untranslated copy.
+    private static func containsChinese(_ value: String) -> Bool {
+        value.replacingOccurrences(of: "速寻", with: "").unicodeScalars.contains {
+            (0x3400...0x4DBF).contains($0.value) || (0x4E00...0x9FFF).contains($0.value)
+                || (0xF900...0xFAFF).contains($0.value) || (0x20000...0x323AF).contains($0.value)
+        }
+    }
+
+    private func strings(in root: NSView, path: String, excluding: Set<ObjectIdentifier> = []) -> [[String: String]] {
+        var found: [[String: String]] = []
+        func add(_ property: String, _ value: String?, _ at: String) {
+            guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+            found.append(["path": at, "property": property, "text": value])
+        }
+        func walk(_ view: NSView, _ at: String) {
+            guard !excluding.contains(ObjectIdentifier(view)), !view.isHidden else { return }
+            add("toolTip", view.toolTip, at)
+            if let field = view as? NSTextField {
+                add("placeholder", field.placeholderString, at)
+                // Search terms, file paths and saved-search names are user data.
+                if !field.isEditable { add("stringValue", field.stringValue, at) }
+            }
+            if let text = view as? NSTextView, !text.isEditable { add("string", text.string, at) }
+            if let button = view as? NSButton {
+                add("title", button.title, at)
+                add("alternateTitle", button.alternateTitle, at)
+            }
+            if let popup = view as? NSPopUpButton, let menu = popup.menu {
+                found += strings(in: menu, path: at + "/items", update: false).product
+            }
+            if let segmented = view as? NSSegmentedControl {
+                for index in 0..<segmented.segmentCount { add("segment.\(index)", segmented.label(forSegment: index), at) }
+            }
+            if let table = view as? NSTableView {
+                for (index, column) in table.tableColumns.enumerated() { add("column.\(index)", column.title, at) }
+            }
+            if let menu = view.menu {
+                found += strings(in: menu, path: at + "/menu", update: true).product
+            }
+            if let search = view as? NSSearchField, let menu = search.searchMenuTemplate {
+                found += strings(in: menu, path: at + "/searchMenu", update: false).product
+            }
+            for (index, child) in view.subviews.enumerated() {
+                walk(child, at + "/\(String(describing: type(of: child)))[\(index)]")
+            }
+        }
+        walk(root, path)
+        return found
+    }
+
+    private func strings(in menu: NSMenu, path: String, update: Bool) -> (product: [[String: String]], shared: [[String: String]]) {
+        if update { menu.delegate?.menuNeedsUpdate?(menu) }
+        var product: [[String: String]] = [], shared: [[String: String]] = []
+        if !menu.title.isEmpty { product.append(["path": path, "property": "menu.title", "text": menu.title]) }
+        for (index, item) in menu.items.enumerated() where !item.isSeparatorItem && !item.isHidden {
+            let at = path + "/item[\(index)]"
+            let value = ["path": at, "property": "title", "text": item.title]
+            // These menu items are supplied by the shared lifecycle source, which this product
+            // task must not edit. Keep their actual text in the separate follow-up report.
+            let isShared = item.target.map { String(describing: type(of: $0)).contains("AppLifecycleUI") } ?? false
+            if isShared { shared.append(value) } else { product.append(value) }
+            if let child = item.submenu {
+                let values = strings(in: child, path: at, update: update)
+                product += values.product; shared += values.shared
+            }
+        }
+        return (product, shared)
+    }
+
+    private func auditLocalization(_ name: String, views: [NSView], title: String? = nil) {
+        guard localizationLanguage != nil else { return }
+        var values = views.enumerated().flatMap { strings(in: $0.element, path: "\(name)/view[\($0.offset)]") }
+        if let title { values.append(["path": name, "property": "window.title", "text": title]) }
+        localizationSurfaces[name] = values
+    }
+
+    private func finishLocalization(settings: SettingsWindowController) {
+        guard let language = localizationLanguage else { return }
+        if let menu = NSApp.mainMenu {
+            let values = strings(in: menu, path: "main-menu", update: true)
+            localizationSurfaces["main-menu"] = values.product
+            localizationShared += values.shared
+        }
+        for (index, menu) in search.interfaceMenusForTesting.enumerated() {
+            let values = strings(in: menu, path: "search-menu[\(index)]", update: false)
+            localizationSurfaces["search-menu-\(index)"] = values.product
+            localizationShared += values.shared
+        }
+        localizationSurfaces["engine-state-labels"] = (0...6).compactMap { EngineState(rawValue: UInt8($0)) }.map {
+            ["path": "engine-state/\($0.rawValue)", "property": "label", "text": SiftText.title($0.label)]
+        }
+        let groups = settings.groups()
+        if let window = groups.first?.window, let view = window.contentView {
+            localizationShared += strings(in: view, path: "shared-settings", excluding: Set(groups.map(ObjectIdentifier.init)))
+            localizationShared.append(["path": "shared-settings", "property": "window.title", "text": window.title])
+        }
+        let remaining = localizationSurfaces.sorted(by: { $0.key < $1.key }).flatMap { name, rows in
+            // The language options name each language in itself (shared LifecycleLanguage): 简体中文 stays Chinese.
+            rows.filter { Self.containsChinese($0["text"] ?? "") && !LifecycleLanguage.allCases.map(\.title).contains($0["text"] ?? "") }.map { row -> [String: String] in
+                var result = row; result["surface"] = name; return result
+            }
+        }
+        let preferred = Bundle.main.preferredLocalizations.first ?? ""
+        let domain = Bundle.main.bundleIdentifier ?? ""
+        check("localization_private_readonly_instance", domain.hasPrefix(Lifecycle.isolatedBundlePrefix)
+              && Prefs.readOnly && Lifecycle.isolated && Self.tempFixture != nil,
+              ["preference_domain": domain, "support_directory": AppDelegate.supportDirectory.path])
+        check("localization_requested_language_loaded", preferred == language || (language == "zh-Hans" && preferred.hasPrefix("zh")),
+              ["requested": language, "preferred": preferred])
+        check("localization_windows_remain_offscreen", NSApp.activationPolicy() == .prohibited && NSApp.windows.allSatisfy { !$0.isVisible })
+        check("english_major_views_no_chinese", language != "en" || remaining.isEmpty, remaining)
+        details["localization"] = ["language": language, "preferred_localizations": Bundle.main.preferredLocalizations,
+            "preference_domain": domain, "support_directory": AppDelegate.supportDirectory.path,
+            "surfaces": localizationSurfaces, "remaining_chinese": remaining,
+            "shared_remaining_chinese": localizationShared.filter { Self.containsChinese($0["text"] ?? "") },
+            "excluded_user_data": "Editable control values; fixture file names, paths and search terms are ASCII. The Chinese brand name 速寻 is allowed."]
+    }
+
     // MARK: Run
 
     private func run() async {
@@ -211,7 +367,11 @@ final class UISelfTest {
         check("index_ready", ready && status.files > 0, ["state": status.state.label, "files": status.files])
 
         mark("window")
+        #if APP_STORE
+        search.prepareOffscreen(size:NSSize(width:1280,height:800))
+        #else
         search.prepareOffscreen(size: NSSize(width: 1000, height: 600))
+        #endif
         check("search_window_built_offscreen", search.window?.contentView != nil && search.window?.isVisible == false)
         // Normalize the user's saved toggles (read-only here; nothing is written back).
         if !search.caseInsensitiveForTesting { search.toggleCase(nil) }
@@ -222,9 +382,13 @@ final class UISelfTest {
         check("query_rows", readme.count >= 2 && Set(readme).isSuperset(of: ["README.md", "readme-notes.txt"]), readme)
         let expanded = await query("nested notes")
         let expandedStatus = search.refreshStatusForTesting().status
-        check("loosened_query_status", expanded == ["readme-notes.txt"] && expandedStatus.contains("Expanded folder query: (nested|*nested*/**) (notes|*notes*/**)"), expandedStatus)
+        let expandedQuery = "(nested|*nested*/**) (notes|*notes*/**)"
+        let expandedLabel = String(localized: " · Expanded folder query: \(expandedQuery)", table: "Search")
+        check("loosened_query_status", expanded == ["readme-notes.txt"] && expandedStatus.contains(expandedLabel), expandedStatus)
+        auditLocalization("search-expanded", views: search.window?.contentView.map { [$0] } ?? [], title: search.window?.title)
         _ = await query("readme")
-        check("strict_query_clears_loosened_status", !search.refreshStatusForTesting().status.contains("Expanded folder query:"))
+        let expandedPrefix = String(localized: " · Expanded folder query: \(String())", table: "Search")
+        check("strict_query_clears_loosened_status", !search.refreshStatusForTesting().status.contains(expandedPrefix))
         let sorted = await query("sortcase")
         check("query_fixture_rows", sorted.count == 3 && Set(sorted) == ["sortcase-alpha.dat", "sortcase-beta.dat", "sortcase-gamma.dat"], sorted)
         check("first_row_selected", search.selectedRowForTesting == 0, search.selectedRowForTesting)
@@ -269,7 +433,45 @@ final class UISelfTest {
         let unscoped = await query("readme")
         check("single_query_restores_unscoped_results", !search.folderVisibleForTesting && unscoped.count == allReadme.count, unscoped)
 
+        mark("filters and export")
+        _ = await query("alpha")
+        search.applyFiltersForTesting(type:1,date:1,size:0)
+        let pdfToday = await settled()
+        check("type_and_date_filters_find_fixture_pdf",pdfToday == ["alpha.pdf"],pdfToday)
+        #if APP_STORE
+        try? search.writeSnapshot(to:outDir.appendingPathComponent("search-filtered.png"))
+        screenshots.append(outDir.appendingPathComponent("search-filtered.png").path)
+        #endif
+        search.applyFiltersForTesting(type:0,date:0,size:1)
+        let tooSmall = await query("sortcase")
+        check("size_filter_excludes_small_files",tooSmall.isEmpty,tooSmall)
+        search.applyFiltersForTesting(type:0,date:0,size:0)
+        _ = await query("sortcase")
+        if case .results(let results) = engine.search(query:"sortcase",folder:nil,caseInsensitive:true) {
+            do {
+                let json = outDir.appendingPathComponent("results.json")
+                let csv = outDir.appendingPathComponent("results.csv")
+                let paths = outDir.appendingPathComponent("results.txt")
+                let counts = try [ResultExporter.write(engine:engine,results:results,to:json,format:0),
+                                  ResultExporter.write(engine:engine,results:results,to:csv,format:1),
+                                  ResultExporter.write(engine:engine,results:results,to:paths,format:2)]
+                let object = try JSONSerialization.jsonObject(with:Data(contentsOf:json)) as? [String:Any]
+                let csvRows = try String(contentsOf:csv,encoding:.utf8).split(whereSeparator:\.isNewline)
+                let pathRows = try String(contentsOf:paths,encoding:.utf8).split(whereSeparator:\.isNewline)
+                check("export_json_csv_paths_match_result_count",counts == [3,3,3] && object?["exported"] as? Int == 3
+                    && csvRows.count == 4 && pathRows.count == 3,["counts":counts,"csv_rows":csvRows.count,"paths":pathRows.count])
+            } catch { check("export_json_csv_paths_match_result_count",false,error.localizedDescription) }
+        } else { check("export_json_csv_paths_match_result_count",false,"search failed") }
+
         let beforeRows = search.cachedVisibleRowsForTesting
+        search.windowDidBecomeKey(Notification(name: NSWindow.didBecomeKeyNotification, object: search.window))
+        search.windowDidChangeOcclusionState(Notification(name: NSWindow.didChangeOcclusionStateNotification, object: search.window))
+        check("offscreen_window_does_not_poll_status", !search.statusPollingForTesting)
+        let beforeRetries = search.backgroundSearchesForTesting
+        search.retryBackgroundRefreshForTesting()
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        check("background_revision_retry_waits_for_visible_tick", search.backgroundSearchesForTesting == beforeRetries
+              && search.searchSettledForTesting && search.cachedVisibleRowsForTesting == beforeRows)
         let icons = beforeRows.map { IconCache.shared.icon(for: $0) }
         check("row_icons_retain_only_small_retina_bitmaps", !icons.isEmpty && icons.allSatisfy {
             $0.size == NSSize(width: 16, height: 16) && !$0.representations.isEmpty
@@ -330,14 +532,19 @@ final class UISelfTest {
         let empty = await query("")
         let emptyStatus = search.refreshStatusForTesting()
         check("empty_query_lists_nothing", empty.isEmpty && search.resultCountForTesting == 0
-              && emptyStatus.status.hasPrefix("Type to search"), emptyStatus.status)
+              && emptyStatus.status == String(localized: "Type to search · ↓ to results · ↩ open · ⌘R reveal · Space Quick Look · ⌘Y history", table: "Search"), emptyStatus.status)
+        auditLocalization("search-empty", views: search.window?.contentView.map { [$0] } ?? [], title: search.window?.title)
 
         mark("status")
         _ = await query("sortcase")
         let st = search.refreshStatusForTesting()
-        check("status_bar_counts", st.state == .ready && st.count.hasSuffix(" files") && st.count != "0 files"
-              && st.status.hasPrefix("3 results"), ["count": st.count, "status": st.status])
-        check("rebuild_required_label", EngineState.rebuildRequired.label.hasPrefix("Index incomplete"),
+        let fileCount = Format.count(engine.status().files)
+        let resultCount = Format.count(3)
+        let expectedResults = String(localized: "\(resultCount) results · \(String()) ms", table: "Search").components(separatedBy: " · ").first ?? ""
+        check("status_bar_counts", st.state == .ready && st.count == String(localized: "\(fileCount) files", table: "Search")
+              && engine.status().files > 0 && !expectedResults.isEmpty && st.status.hasPrefix(expectedResults), ["count": st.count, "status": st.status])
+        auditLocalization("search-results", views: search.window?.contentView.map { [$0] } ?? [], title: search.window?.title)
+        check("rebuild_required_label", EngineState.rebuildRequired.label == "Catching up in the background",
               "state mapping only: a lost-event rebuild cannot be induced on the offline fixture")
         let filesBefore = engine.status().files
         search.rescan(nil)
@@ -368,11 +575,26 @@ final class UISelfTest {
             search.window?.appearance = appearance
             settings.window?.appearance = appearance
             try? await Task.sleep(nanoseconds: 200_000_000)
+            if localizationLanguage != nil {
+                for (state, term) in [("empty", ""), ("no-results", "sift-l10n-no-such-file-73b4")] {
+                    _ = await query(term)
+                    _ = search.refreshStatusForTesting()
+                    let url = outDir.appendingPathComponent("search-\(state)-\(mode).png")
+                    try? search.writeSnapshot(to: url)
+                    check("png_search_\(state)_\(mode)", Self.imageStats(url).map { $0.distinct >= 8 && $0.stddev > 0.02 } ?? false)
+                    screenshots.append(url.path)
+                    auditLocalization("search-\(state)-\(mode)", views: search.window?.contentView.map { [$0] } ?? [], title: search.window?.title)
+                }
+                _ = await query("sortcase")
+                search.moveSelectionForTesting(by: 1)
+                _ = search.refreshStatusForTesting()
+            }
             _ = await waitUntil(5) { search.snapshotReady }
             let searchURL = outDir.appendingPathComponent("search-\(mode).png")
             let settingsURL = outDir.appendingPathComponent("settings-\(mode).png")
             try? search.writeSnapshot(to: searchURL)
             try? settings.writeSnapshot(to:settingsURL)
+            auditLocalization("settings-tab0-\(mode)", views: settings.groups(), title: settings.window?.title)
             for tab in 1...4 {
                 settings.selectTabForTesting(tab)
                 let tabURL = outDir.appendingPathComponent("settings-tab\(tab)-\(mode).png")
@@ -380,12 +602,17 @@ final class UISelfTest {
                 let stats = Self.imageStats(tabURL)
                 check("png_settings_tab\(tab)_\(mode)",stats.map{$0.distinct >= 8 && $0.stddev > 0.02} ?? false)
                 screenshots.append(tabURL.path)
+                auditLocalization("settings-tab\(tab)-\(mode)", views: settings.groups(), title: settings.window?.title)
             }
             settings.selectTabForTesting(0)
+            #if APP_STORE
+            check("store_channel_and_granted_root_controls",settings.storeChannelForTesting)
+            #else
             let updateURL = outDir.appendingPathComponent("settings-updates-\(mode).png")
             try? settings.writeSnapshot(to:updateURL,showUpdates:true)
             check("png_updates_\(mode)",Self.imageStats(updateURL).map{$0.width >= 1000 && $0.distinct >= 8 && $0.stddev > 0.02} ?? false)
             screenshots.append(updateURL.path)
+            #endif
             for url in [searchURL, settingsURL] {
                 let stats = Self.imageStats(url)
                 let key = url.deletingPathExtension().lastPathComponent
@@ -399,6 +626,7 @@ final class UISelfTest {
             let light = luminance["\(window)-light"] ?? 0, dark = luminance["\(window)-dark"] ?? 1
             check("\(window)_dark_differs_from_light", dark + 0.2 < light, ["light": light, "dark": dark])
         }
+        finishLocalization(settings: settings)
 
         mark("close")
         let hidesBefore = search.hideRequestsForTesting
@@ -473,16 +701,27 @@ final class UISelfTest {
     private static func imageStats(_ url: URL) -> Stats? {
         guard let data = try? Data(contentsOf: url), let rep = NSBitmapImageRep(data: data),
               rep.pixelsWide > 100, rep.pixelsHigh > 100 else { return nil }
+        // Convert once, rather than allocating/converting an NSColor for every grid pixel.
+        // Keep the same grid and premultiplied RGB statistics, including every screenshot check.
+        guard let source = rep.cgImage,
+              let bitmap = CGContext(data: nil, width: rep.pixelsWide, height: rep.pixelsHigh,
+                                     bitsPerComponent: 8, bytesPerRow: rep.pixelsWide * 4,
+                                     space: CGColorSpaceCreateDeviceRGB(),
+                                     bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                                         | CGBitmapInfo.byteOrder32Big.rawValue),
+              let storage = bitmap.data else { return nil }
+        bitmap.draw(source, in: CGRect(x: 0, y: 0, width: rep.pixelsWide, height: rep.pixelsHigh))
+        let pixels = storage.assumingMemoryBound(to: UInt8.self)
         var values: [Double] = []
         var colors = Set<UInt32>()
         let step = 3
         for y in stride(from: 0, to: rep.pixelsHigh, by: step) {
             for x in stride(from: 0, to: rep.pixelsWide, by: step) {
-                guard let c = rep.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
-                let a = c.alphaComponent
-                let r = c.redComponent * a, g = c.greenComponent * a, b = c.blueComponent * a
+                let offset = y * bitmap.bytesPerRow + x * 4
+                let red = pixels[offset], green = pixels[offset + 1], blue = pixels[offset + 2]
+                let r = Double(red) / 255, g = Double(green) / 255, b = Double(blue) / 255
                 values.append(0.2126 * r + 0.7152 * g + 0.0722 * b)
-                colors.insert(UInt32(r * 255) << 16 | UInt32(g * 255) << 8 | UInt32(b * 255))
+                colors.insert(UInt32(red) << 16 | UInt32(green) << 8 | UInt32(blue))
             }
         }
         guard !values.isEmpty else { return nil }

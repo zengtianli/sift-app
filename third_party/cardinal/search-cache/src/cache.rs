@@ -914,6 +914,13 @@ impl SearchCache {
         self.last_event_id
     }
 
+    /// Moves the watermark back to an event ID before a delivery gap, so the next
+    /// stream replays the dropped span from FSEvents history and a snapshot saved
+    /// meanwhile never records a watermark past events it did not see.
+    pub fn rewind_last_event_id(&mut self, event_id: u64) {
+        self.last_event_id = self.last_event_id.min(event_id);
+    }
+
     pub fn rescan_count(&self) -> u64 {
         self.rescan_count
     }

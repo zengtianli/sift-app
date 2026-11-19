@@ -14,7 +14,7 @@ enum EngineState: UInt8 {
         case .updating: return "Catching up with changes"
         case .ready: return "Ready"
         case .stopped: return "Stopped"
-        case .rebuildRequired: return "Index incomplete · Background repair pending"
+        case .rebuildRequired: return "Catching up in the background"
         }
     }
 }
@@ -111,7 +111,13 @@ final class Engine {
     }
 
     func details() -> [String: Any] {
-        guard let text = sift_engine_details(raw) else { return [:] }
+        decodeDetails(sift_engine_details(raw))
+    }
+    func indexDetails() -> [String: Any] {
+        decodeDetails(sift_engine_index_details(raw))
+    }
+    private func decodeDetails(_ pointer: UnsafeMutablePointer<CChar>?) -> [String: Any] {
+        guard let text = pointer else { return [:] }
         defer { sift_string_free(text) }
         return (try? JSONSerialization.jsonObject(with: Data(String(cString: text).utf8))) as? [String: Any] ?? [:]
     }

@@ -1,6 +1,6 @@
 use crate::{EventFlag, FsEvent};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
+use dispatch2::{DispatchQoS, DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use libc::dev_t;
 use objc2_core_foundation::{CFArray, CFString, CFTimeInterval};
 use objc2_core_services::{
@@ -135,7 +135,13 @@ impl EventStream {
 
     // Start the FSEventStream with a dispatch queue.
     pub fn spawn(self) -> Option<EventStreamWithQueue> {
-        let queue = DispatchQueue::new("cardinal-sdk-queue", DispatchQueueAttr::SERIAL);
+        // The callback only filters and hands events to a channel, but it must run
+        // promptly: FSEvents buffers undelivered events per client and, when that
+        // buffer fills, replaces them with a root-level UserDropped that forces a full
+        // re-index. At default QoS a saturated CPU (a build, login) starved this queue
+        // and dropped ~40x more often than an idle-callback client (Sift 2026-11-04).
+        let attr = DispatchQueueAttr::with_qos_class(DispatchQueueAttr::SERIAL, DispatchQoS::UserInteractive, 0);
+        let queue = DispatchQueue::new("cardinal-sdk-queue", Some(&attr));
         unsafe { FSEventStreamSetDispatchQueue(self.stream, Some(&queue)) };
         let result = unsafe { FSEventStreamStart(self.stream) };
         if !result {

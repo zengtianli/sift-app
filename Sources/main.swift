@@ -15,10 +15,17 @@ if let verb = launchWords.first, ["config", "update"].contains(verb) {
 }
 #else
 if AppLifecycleCLI.handles(launchWords.first) { exit(Lifecycle.run(launchWords)) }
+// `Sift feed <latest.json>`: the release's latest.json read by this build's own parser (update_feed.py make runs it
+// before a release, shared AppUpdateFeed.swift). Offline; nothing is downloaded or installed.
+if AppUpdateFeed.handles(launchWords.first) {
+    exit(AppUpdateFeed.run(launchWords, bundleID: Lifecycle.hostBundle.bundleIdentifier ?? Lifecycle.productID, bundle: Lifecycle.hostBundle))
+}
 // Before anything reads the environment: the lifecycle self-test runs on its own fixture, folders and preferences.
 if Prefs.lifecycleSelfTest { LifecycleSelfTest.prepareEnvironment(arguments: launchWords) }
 #endif
 
+// The menu bar icon is on unless turned off in Settings: its drop-down (⌃⌥S) holds Quit for the menu-bar-resident app.
+UserDefaults.standard.register(defaults: ["menuBar": true])
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

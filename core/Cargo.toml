@@ -1,6 +1,6 @@
 [package]
 name = "sift-core"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 license = "MIT"
 description = "Sift engine: Cardinal's file index behind a C ABI, a local socket and a CLI"
@@ -33,5 +33,11 @@ lto = "fat"
 codegen-units = 1
 strip = true
 debug = false
+
+# macOS 27 rejects some proc-macro dylibs stripped by this pinned Rust's LLVM
+# (mis-aligned LINKEDIT string pool, surfaced as E0463). Keep host build tools
+# intact; the shipped core and CLI still use the release strip setting above.
+[profile.release.build-override]
+strip = "none"
 
 [workspace]

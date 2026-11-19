@@ -52,7 +52,10 @@ enum AppLifecycleCLI {
 
     /// What the menu calls the item that opens this window. `AppLifecycleUI` adds it under this name; a product that
     /// opens the window from its own item passes that item's title instead, from one constant of its own.
-    static let defaultWindowEntry = "配置与更新…"
+    static let defaultWindowEntry = "设置…"
+    /// The shared window's name in a product that has its own settings page (`AppLifecycleUI.useSettings`): pass this
+    /// as `windowEntry` so the help names the item that really opens it (⌘, 设置… is the product's page there).
+    static let updatesWindowEntry = "配置与更新…"
 
     /// Read-only: neither line writes a file or any state, so they can sit under a product heading that promises that.
     static func helpRead(_ command: String) -> String {
@@ -62,7 +65,7 @@ enum AppLifecycleCLI {
         """
     }
     /// The update line alone, for a product that already lists its own `config` commands and wires only `update`.
-    static let helpUpdate = "  update check               检查更新：当前版本、此渠道最新版本、有没有新版、怎么升级（不改配置或安装；记录本机检查结果；私有渠道读 iCloud Drive 里的发行记录，公开渠道联网读发行记录）"
+    static let helpUpdate = "  update check               检查更新：当前版本、此渠道最新版本、有没有新版、怎么升级（只读：不改配置、不安装、不记录检查结果；私有渠道读 iCloud Drive 里的发行记录，公开渠道联网读发行记录）"
     static let helpOptions = "  update options [--yes]     查看或保存自动检查/下载/安装、间隔、渠道、跳过与延后选项（--dry-run 只预演）"
     /// The upgrade line alone, for a product that already lists its own `config` commands and wires only `update`.
     static func helpInstall(_ command: String) -> String {
@@ -98,7 +101,7 @@ enum AppLifecycleCLI {
                \(command) update options [--auto-check on|off] [--auto-download on|off] [--auto-install on|off]
                    [--interval 1..720] [--channel <name>] [--skip <version/build|clear>] [--remind 0..720] [--yes|--dry-run] [--json]
         「\(windowEntry)」窗口里的各项，与窗口读写同一份设置、走同一个安装器。
-        查询（update check 记录本机检查时间与结果）:
+        查询（update check 只读，不记录本机检查时间与结果；窗口里的检查才会记录）:
         \(helpRead(command))
         写:
         \(helpWrite(command))
@@ -357,7 +360,7 @@ enum AppLifecycleCLI {
         let current: [String: Any] = ["version": version, "build": build]
         let source = describe(AppUpdatePreferences.source(product.updateSource,bundle.bundleIdentifier ?? ""))
         let box = Box<Result<AppRelease, Error>>()
-        AppUpdateChecker.check(source: product.updateSource, bundleID: bundle.bundleIdentifier ?? "", version: version, build: build) { box.set($0) }
+        AppUpdateChecker.check(source: product.updateSource, bundleID: bundle.bundleIdentifier ?? "", version: version, build: build, record: false) { box.set($0) }
         wait(product.timeout) { box.value != nil }
         let release: AppRelease
         switch box.value {
@@ -561,6 +564,8 @@ enum AppLifecycleCLI {
         guard ProcessInfo.processInfo.environment["APP_LIFECYCLE_NO_RELAUNCH"] != "1" else { return false }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open"); process.arguments = ["-g", "-j", app.path]
+        // open hands the caller's environment to the app; the shell's TZ is for Claude only, apps follow the system zone.
+        var environment = ProcessInfo.processInfo.environment; environment.removeValue(forKey: "TZ"); process.environment = environment
         guard (try? process.run()) != nil else { return false }
         process.waitUntilExit()
         return process.terminationStatus == 0

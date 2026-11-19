@@ -69,6 +69,28 @@ fn settings_save_through_the_c_abi_is_live_for_the_cli() {
     let engine = unsafe { ffi::sift_engine_start(dir.as_ptr()) };
     assert!(!engine.is_null());
     let before = wait_status(&support, "index ready", |v| v["state"] == "ready");
+    // Frequent GUI status uses the real C ABI without probing ServiceManagement.
+    // Explicit status keeps its live system fields and still invokes the probe.
+    static PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    extern "C" fn login_probe() -> i32 {
+        PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        1
+    }
+    unsafe { ffi::sift_engine_set_login_item_probe(engine, Some(login_probe)); }
+    for _ in 0..16 {
+        let text = unsafe { ffi::sift_engine_index_details(engine) };
+        let v: Value = serde_json::from_str(unsafe { std::ffi::CStr::from_ptr(text) }.to_str().unwrap()).unwrap();
+        unsafe { ffi::sift_string_free(text); }
+        assert_eq!(v["root"], before["root"]);
+        assert!(v["index_revision"].is_number() && v["state"].is_string());
+        assert!(v.get("login_item").is_none() && v.get("full_disk_access").is_none() && v.get("app").is_none());
+    }
+    assert_eq!(PROBES.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let full = unsafe { ffi::sift_engine_details(engine) };
+    let full_status: Value = serde_json::from_str(unsafe { std::ffi::CStr::from_ptr(full) }.to_str().unwrap()).unwrap();
+    unsafe { ffi::sift_string_free(full); ffi::sift_engine_set_login_item_probe(engine, None); }
+    assert_eq!(full_status["login_item"], "enabled");
+    assert_eq!(PROBES.load(std::sync::atomic::Ordering::Relaxed), 1);
     let walks = before["walks"].as_u64().unwrap();
     assert_eq!(sift(&support, &["search", "hidden-target"]).0, 0);
 

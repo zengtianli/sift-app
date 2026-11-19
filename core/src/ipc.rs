@@ -296,7 +296,7 @@ pub struct SocketBlocked {
 
 impl std::fmt::Display for SocketBlocked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "access to Sift socket {} was blocked: {}; retry outside the guard: ~/Dev/tools/dev/lib/tools/cc/guarded-bin/outside-guard -- sift …", self.path.display(), self.source)
+        write!(f, "access to Sift socket {} was blocked: {}; retry the same sift command from a process allowed to reach the socket (outside that sandbox or guard)", self.path.display(), self.source)
     }
 }
 

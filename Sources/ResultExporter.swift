@@ -48,7 +48,8 @@ enum ResultExporter {
     }
     static func export(engine:Engine,results:ResultSet,window:NSWindow) {
         let panel = NSSavePanel();panel.nameFieldStringValue = "Sift-results.json"
-        let format = NSPopUpButton();format.addItems(withTitles:["JSON","CSV","路径清单"]);panel.accessoryView = format
+        let format = NSPopUpButton();format.addItems(withTitles:["JSON","CSV",String(localized: "Path List")]);panel.accessoryView = format
+        panel.message = String(localized: "Export the current search results as JSON, CSV, or a list of paths.")
         let selection = FormatSelection(panel);format.target = selection;format.action = #selector(FormatSelection.changed(_:));selection.changed(format)
         panel.beginSheetModal(for:window) { [selection] response in
             _ = selection // NSControl's target is weak; retain it for this sheet's lifetime.
@@ -57,8 +58,8 @@ enum ResultExporter {
             DispatchQueue.global(qos:.utility).async {
                 do {
                     let count = try write(engine:engine,results:results,to:destination,format:selected)
-                    DispatchQueue.main.async { let alert = NSAlert();alert.messageText = "已导出 \(count) 项结果";alert.informativeText = destination.path;alert.beginSheetModal(for:window,completionHandler:nil) }
-                } catch { DispatchQueue.main.async{NSApp.presentError(error)} }
+                    DispatchQueue.main.async { let alert = NSAlert();alert.messageText = String(localized: "Exported \(count) results");alert.informativeText = destination.path;alert.beginSheetModal(for:window,completionHandler:nil) }
+                } catch { DispatchQueue.main.async{NSApp.presentError(SiftText.error(error))} }
             }
         }
     }

@@ -116,21 +116,21 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
         caseButton.setButtonType(.pushOnPushOff)
         caseButton.bezelStyle = .texturedRounded
         caseButton.title = "Aa"
-        caseButton.toolTip = "Match case (⌘I)"
+        caseButton.toolTip = String(localized: "Match case (⌘I)", table: "Search")
         caseButton.state = caseInsensitive ? .off : .on
         caseButton.target = self
         caseButton.action = #selector(toggleCaseFromButton)
 
         historyButton.bezelStyle = .texturedRounded
-        historyButton.image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: "Recent searches")
-        historyButton.toolTip = "Recent searches (⌘Y)"
+        historyButton.image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: String(localized: "Recent searches", table: "Search"))
+        historyButton.toolTip = String(localized: "Recent searches (⌘Y)", table: "Search")
         historyButton.target = self
         historyButton.action = #selector(showHistory(_:))
 
         let input = NSStackView(views: [searchField, caseButton, historyButton]);input.spacing = 8
-        typeFilter.addItems(withTitles:["所有类型","PDF","Word","Excel","HTML","图片 PNG","Markdown"])
-        dateFilter.addItems(withTitles:["任何修改时间","今天","本周"])
-        sizeFilter.addItems(withTitles:["任何大小","大于 1 MB","大于 100 MB"])
+        typeFilter.addItems(withTitles:[String(localized: "All types", table: "Search"),"PDF","Word","Excel","HTML",String(localized: "PNG images", table: "Search"),"Markdown"])
+        dateFilter.addItems(withTitles:[String(localized: "Any modification date", table: "Search"),String(localized: "Today", table: "Search"),String(localized: "This week", table: "Search")])
+        sizeFilter.addItems(withTitles:[String(localized: "Any size", table: "Search"),String(localized: "Larger than 1 MB", table: "Search"),String(localized: "Larger than 100 MB", table: "Search")])
         for filter in [typeFilter,dateFilter,sizeFilter] { filter.controlSize = .small;filter.target = self;filter.action = #selector(filtersChanged) }
         let filters = NSStackView(views:[typeFilter,dateFilter,sizeFilter,NSView()]);filters.spacing = 6
         let top = NSStackView(views:[input,filters])
@@ -359,15 +359,16 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
     var hideRequestsForTesting = 0
     var cachedVisibleRowsForTesting: [FileRow] { model.cachedRows(in: visibleRange) }
     func refreshResultsForTesting() { runSearch(preserveSelection: true) }
+    func retryBackgroundRefreshForTesting() { retryIfLatest(generation, preserveSelection: true) }
     func moveSelectionForTesting(by delta: Int) { moveSelection(by: delta) }
     /// The status line as the visible window's 1 s timer would set it (the offscreen window is never visible).
     func refreshStatusForTesting() -> (state: EngineState, count: String, status: String) {
-        let details = engine.details()
+        let details = engine.indexDetails()
         observeIndex(details)
         let status = engine.status()
         engineState = status.state
         let files = Format.count(status.files)
-        countLabel.stringValue = status.state == .ready ? "\(files) files" : "\(status.state.label) · \(files)"
+        countLabel.stringValue = status.state == .ready ? Self.fileCountText(status.files, files) : "\(SiftText.title(status.state.label)) · \(files)"
         updateStatusLabel(details)
         return (status.state, countLabel.stringValue, statusLabel.stringValue)
     }
@@ -442,10 +443,18 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
     }
 
     func windowDidBecomeKey(_ notification: Notification) { startStatusUpdates() }
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        if shouldPollStatus { startStatusUpdates() } else { stopStatusUpdates() }
+    }
+    private var shouldPollStatus: Bool {
+        window?.isVisible == true && window?.occlusionState.contains(.visible) == true
+    }
+    var statusPollingForTesting: Bool { statusTimer != nil }
 
     // MARK: Status
 
     private func startStatusUpdates() {
+        guard shouldPollStatus else { stopStatusUpdates(); return }
         refreshStatus()
         guard statusTimer == nil else { return }
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.refreshStatus() }
@@ -459,17 +468,24 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
         statusTimer = nil
     }
 
+    /// English needs a singular; zh-Hans uses the same measure word for both.
+    static func fileCountText<N: BinaryInteger>(_ n: N, _ formatted: String) -> String {
+        n == 1 ? String(localized: "\(formatted) file", table: "Search") : String(localized: "\(formatted) files", table: "Search")
+    }
+
     private func refreshStatus() {
-        guard window?.isVisible == true else { stopStatusUpdates(); return }
-        let details = engine.details()
+        guard shouldPollStatus else { stopStatusUpdates(); return }
+        let details = engine.indexDetails()
         observeIndex(details)
         let status = engine.status()
         engineState = status.state
         let files = Format.count(status.files)
         if status.state == .ready {
-            countLabel.stringValue = "\(files) files"
+            let text = Self.fileCountText(status.files, files)
+            if countLabel.stringValue != text { countLabel.stringValue = text }
         } else {
-            countLabel.stringValue = "\(status.state.label) · \(files)"
+            let text = "\(SiftText.title(status.state.label)) · \(files)"
+            if countLabel.stringValue != text { countLabel.stringValue = text }
         }
         #if APP_STORE
         if !IndexAccess.hasGrant { countLabel.stringValue = "" }
@@ -480,16 +496,16 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
     }
 
     private func updateStatusLabel(_ currentDetails: [String: Any]? = nil) {
-        let details = currentDetails ?? engine.details()
+        let details = currentDetails ?? engine.indexDetails()
         if let problem = details["configuration_error"] as? String,!problem.isEmpty {
-            statusLabel.stringValue = problem;statusLabel.textColor = .systemRed;return
+            statusLabel.stringValue = SiftText.title(problem);statusLabel.textColor = .systemRed;return
         }
-        if let problem = details["runtime_error"] as? String,!problem.isEmpty { statusLabel.stringValue = problem;statusLabel.textColor = .systemRed;return }
+        if let problem = details["runtime_error"] as? String,!problem.isEmpty { statusLabel.stringValue = SiftText.title(problem);statusLabel.textColor = .systemRed;return }
         #if APP_STORE
         accessButton.isHidden = IndexAccess.hasGrant
         #endif
         if let lastError {
-            statusLabel.stringValue = lastError
+            statusLabel.stringValue = SiftText.title(lastError)
             statusLabel.textColor = .systemRed
             return
         }
@@ -502,18 +518,22 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
         }
         #endif
         if details["paused"] as? Bool == true || details["rebuild_required"] as? Bool == true {
-            statusLabel.stringValue = SiftDiagnostics.summary(details);statusLabel.textColor = .systemOrange
+            statusLabel.stringValue = SiftDiagnostics.summary(details)
+            statusLabel.textColor = SiftDiagnostics.needsAttention(details) ? .systemOrange : .secondaryLabelColor
         } else if currentQuery.isEmpty && currentFolder.isEmpty {
-            statusLabel.stringValue = "Type to search · ↓ to results · ↩ open · ⌘R reveal · Space Quick Look · ⌘Y history"
+            statusLabel.stringValue = String(localized: "Type to search · ↓ to results · ↩ open · ⌘R reveal · Space Quick Look · ⌘Y history", table: "Search")
         } else if appliedGeneration != generation && !backgroundSearch {
             statusLabel.stringValue = engineState == .loading || engineState == .scanning || engineState == .starting
-                ? "Searching once the index is loaded…" : "Searching…"
+                ? String(localized: "Searching once the index is loaded…", table: "Search") : String(localized: "Searching…", table: "Search")
         } else {
             let n = model.count
             let ms = lastQueryMillis < 10 ? String(format: "%.1f", lastQueryMillis) : String(format: "%.0f", lastQueryMillis)
-            statusLabel.stringValue = "\(Format.count(n)) \(n == 1 ? "result" : "results") · \(ms) ms"
+            let count = Format.count(n)
+            statusLabel.stringValue = n == 1
+                ? String(localized: "\(count) result · \(ms) ms", table: "Search")
+                : String(localized: "\(count) results · \(ms) ms", table: "Search")
             if let loosened = model.results?.loosened {
-                statusLabel.stringValue += " · Expanded folder query: \(loosened)"
+                statusLabel.stringValue += String(localized: " · Expanded folder query: \(loosened)", table: "Search")
             }
         }
         statusLabel.toolTip = statusLabel.stringValue
@@ -544,6 +564,10 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
         return [searchField.stringValue.trimmingCharacters(in:.whitespaces),filters[max(0,typeFilter.indexOfSelectedItem)],dates[max(0,dateFilter.indexOfSelectedItem)],sizes[max(0,sizeFilter.indexOfSelectedItem)]].filter{!$0.isEmpty}.joined(separator:" ")
     }
     @objc private func filtersChanged() { runSearch() }
+    func applyFiltersForTesting(type:Int,date:Int,size:Int) {
+        typeFilter.selectItem(at:type);dateFilter.selectItem(at:date);sizeFilter.selectItem(at:size);filtersChanged()
+    }
+    var typeFilterFrameForTesting:NSRect { typeFilter.convert(typeFilter.bounds,to:window!.contentView!) }
     private func observeIndex(_ details: [String: Any]) {
         let revision = (details["index_revision"] as? NSNumber)?.uint64Value ?? 0
         guard let previous = lastIndexRevision else { lastIndexRevision = revision; return }
@@ -657,6 +681,16 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
     /// Searches run on a concurrent queue and each takes a fresh cancellation token when it starts, so an
     /// older search that starts late can cancel the newest one. Only the newest search is re-run.
     private func retryIfLatest(_ gen: Int, preserveSelection: Bool = false) {
+        guard gen == generation else { return }
+        if preserveSelection {
+            // A changing revision can invalidate sort/page reads. Do not turn
+            // the 2-second passive refresh into an unbounded 100 ms query loop.
+            // Keep the previous rows; the next visible status tick retries the
+            // latest revision through the normal coalescing/rate limit.
+            appliedGeneration = gen
+            lastIndexRevision = 0
+            return
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             guard let self, gen == self.generation else { return }
             self.runSearch(preserveSelection: preserveSelection)
@@ -826,7 +860,11 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
             cell.imageView?.image = item.map { IconCache.shared.icon(for: $0) }
             (cell as? NameCellView)?.show(item?.name ?? "…", highlights: item == nil ? [] : model.highlights)
         case "folder":
+            #if APP_STORE
+            cell.textField?.stringValue = item.map { IndexAccess.abbreviated($0.folder) } ?? ""
+            #else
             cell.textField?.stringValue = item?.folder ?? ""
+            #endif
         case "size":
             cell.textField?.stringValue = item.map(Format.size) ?? ""
         case "created":
@@ -941,15 +979,16 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
         let rows = actionRows()
         guard !rows.isEmpty, !Prefs.dryRun("trash", rows.map(\.path)) else { return }
         let alert = NSAlert()
+        let count = Format.count(rows.count)
         alert.messageText = rows.count == 1
-            ? "Move “\(rows[0].name)” to the Trash?"
-            : "Move \(rows.count) items to the Trash?"
-        alert.informativeText = "You can put items back from the Trash in Finder."
-        alert.addButton(withTitle: "Move to Trash")
-        alert.addButton(withTitle: "Cancel")
+            ? String(localized: "Move “\(rows[0].name)” to the Trash?", table: "Search")
+            : String(localized: "Move \(count) items to the Trash?", table: "Search")
+        alert.informativeText = String(localized: "You can put items back from the Trash in Finder.", table: "Search")
+        alert.addButton(withTitle: String(localized: "Move to Trash", table: "Search"))
+        alert.addButton(withTitle: String(localized: "Cancel", table: "Search"))
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         FileActions.recycle(rows.map { URL(fileURLWithPath: $0.path) }) { [weak self] _, error in
-            if let error { NSApp.presentError(error) }
+            if let error { NSApp.presentError(SiftText.error(error)) }
             self?.runSearch()
         }
     }
@@ -982,9 +1021,15 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
     @objc func showHistory(_ sender: Any?) {
         // A pop-up menu tracks the real mouse and keyboard: never in verification runs.
         if Prefs.dryRun("history menu", history.items) { return }
+        let menu = recentSearchesMenu()
+        let anchor = NSPoint(x: 0, y: historyButton.bounds.height + 4)
+        menu.popUp(positioning: nil, at: anchor, in: historyButton)
+    }
+
+    private func recentSearchesMenu() -> NSMenu {
         let menu = NSMenu()
         if history.items.isEmpty {
-            menu.addItem(NSMenuItem(title: "No recent searches", action: nil, keyEquivalent: ""))
+            menu.addItem(NSMenuItem(title: String(localized: "No recent searches", table: "Search"), action: nil, keyEquivalent: ""))
         } else {
             for q in history.items.prefix(20) {
                 let item = NSMenuItem(title: q, action: #selector(pickHistory(_:)), keyEquivalent: "")
@@ -992,12 +1037,11 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
                 menu.addItem(item)
             }
             menu.addItem(.separator())
-            let clear = NSMenuItem(title: "Clear Recent Searches", action: #selector(clearHistory), keyEquivalent: "")
+            let clear = NSMenuItem(title: String(localized: "Clear Recent Searches", table: "Search"), action: #selector(clearHistory), keyEquivalent: "")
             clear.target = self
             menu.addItem(clear)
         }
-        let anchor = NSPoint(x: 0, y: historyButton.bounds.height + 4)
-        menu.popUp(positioning: nil, at: anchor, in: historyButton)
+        return menu
     }
 
     @objc private func pickHistory(_ item: NSMenuItem) {
@@ -1019,7 +1063,7 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
     }
 
     @objc func rescan(_ sender: Any?) {
-        guard engine.details()["paused"] as? Bool != true else { reportConfigurationError("索引已暂停，请先在设置中恢复后重建");return }
+        guard engine.details()["paused"] as? Bool != true else { reportConfigurationError(String(localized: "Indexing is paused. Resume it in Settings before rebuilding the index.", table: "Search"));return }
         engine.rescan()
         startStatusUpdates()
     }
@@ -1052,13 +1096,17 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         guard table.clickedRow >= 0 else { return }
+        populateContextMenu(menu)
+    }
+
+    private func populateContextMenu(_ menu: NSMenu) {
         // Same items and shortcut hints as Cardinal's context menu, plus Trash.
         let entries: [(String, Selector, String, NSEvent.ModifierFlags)] = [
             ("Open", #selector(openSelection(_:)), "o", .command),
             ("Show in Finder", #selector(revealSelection(_:)), "r", .command),
-            ("用其他应用打开…",#selector(openWithSelection(_:)),"",[]),
-            ("文件信息",#selector(showFileInfo(_:)),"",[]),
-            ("重命名…",#selector(renameSelection(_:)),"",[]),
+            (String(localized: "Open With…", table: "Search"),#selector(openWithSelection(_:)),"",[]),
+            (String(localized: "Get Info", table: "Search"),#selector(showFileInfo(_:)),"",[]),
+            (String(localized: "Rename…", table: "Search"),#selector(renameSelection(_:)),"",[]),
             ("-", #selector(copy(_:)), "", []),
             ("Copy Name", #selector(copyNames(_:)), "n", [.command, .control, .shift]),
             ("Copy Path", #selector(copyPaths(_:)), "C", .command),
@@ -1084,23 +1132,35 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
 
     @objc func saveCurrentSearch(_ sender:Any?) {
         guard !currentQuery.isEmpty,!Prefs.dryRun("save search",[]) else { return }
-        let alert = NSAlert();alert.messageText = "保存常用搜索";alert.informativeText = currentQuery
-        let name = NSTextField(frame:NSRect(x:0,y:0,width:300,height:24));name.placeholderString = "搜索名称";alert.accessoryView = name
-        alert.addButton(withTitle:"保存");alert.addButton(withTitle:"取消")
+        let alert = NSAlert();alert.messageText = String(localized: "Save Search", table: "Search");alert.informativeText = currentQuery
+        let name = NSTextField(frame:NSRect(x:0,y:0,width:300,height:24));name.placeholderString = String(localized: "Search name", table: "Search");alert.accessoryView = name
+        alert.addButton(withTitle:String(localized: "Save", table: "Search"));alert.addButton(withTitle:String(localized: "Cancel", table: "Search"))
         let query = currentQuery,folder = currentFolder,ci = caseInsensitive
         alert.beginSheetModal(for:(sender as? NSWindow) ?? window!) { result in
             guard result == .alertFirstButtonReturn else { return }
-            do { try SavedSearches.add(name:name.stringValue,query:query,folder:folder,caseInsensitive:ci) } catch { NSApp.presentError(error) }
+            do { try SavedSearches.add(name:name.stringValue,query:query,folder:folder,caseInsensitive:ci) } catch { NSApp.presentError(SiftText.error(error)) }
         }
     }
     @objc func showSavedSearches(_ sender:Any?) {
         guard !Prefs.dryRun("saved searches",[]) else { return }
+        let menu = savedSearchesMenu()
+        menu.popUp(positioning:nil,at:NSPoint(x:0,y:historyButton.bounds.height + 4),in:historyButton)
+    }
+
+    private func savedSearchesMenu() -> NSMenu {
         let menu = NSMenu()
         for saved in SavedSearches.items {
             let item = NSMenuItem(title:saved["name"] ?? "",action:#selector(pickSaved(_:)),keyEquivalent:"");item.target = self;item.representedObject = saved;menu.addItem(item)
         }
-        if menu.items.isEmpty { menu.addItem(NSMenuItem(title:"尚无常用搜索，可保存当前搜索",action:nil,keyEquivalent:"")) }
-        menu.popUp(positioning:nil,at:NSPoint(x:0,y:historyButton.bounds.height + 4),in:historyButton)
+        if menu.items.isEmpty { menu.addItem(NSMenuItem(title:String(localized: "No saved searches. Save your current search to add one.", table: "Search"),action:nil,keyEquivalent:"")) }
+        return menu
+    }
+
+    /// The real menu constructors, without starting a pop-up tracking session.
+    var interfaceMenusForTesting: [NSMenu] {
+        let context = NSMenu()
+        populateContextMenu(context)
+        return [context, recentSearchesMenu(), savedSearchesMenu()]
     }
     @objc private func pickSaved(_ item:NSMenuItem) {
         typeFilter.selectItem(at:0);dateFilter.selectItem(at:0);sizeFilter.selectItem(at:0)
@@ -1114,20 +1174,39 @@ final class SearchWindowController: NSWindowController, NSWindowDelegate, NSSear
     }
     @objc func showFileInfo(_ sender:Any?) {
         let rows = actionRows();guard let row = rows.first,!Prefs.dryRun("file info",rows.map(\.path)) else { return }
-        do { let info = try ProductFiles.info(row.path);let alert = NSAlert();alert.messageText = row.name;alert.informativeText = "路径：\(row.path)\n类型：\(info["kind"] ?? "")\n大小：\(info["size"] ?? 0) 字节\n可读：\(info["readable"] ?? false) · 可写：\(info["writable"] ?? false)";alert.beginSheetModal(for:window!,completionHandler:nil) }
-        catch { NSApp.presentError(error) }
+        do {
+            let info = try ProductFiles.info(row.path)
+            let kind: String
+            switch info["kind"] as? String {
+            case FileAttributeType.typeRegular.rawValue: kind = String(localized: "File", table: "Search")
+            case FileAttributeType.typeDirectory.rawValue: kind = String(localized: "Folder", table: "Search")
+            case FileAttributeType.typeSymbolicLink.rawValue: kind = String(localized: "Symbolic link", table: "Search")
+            case FileAttributeType.typeSocket.rawValue: kind = String(localized: "Socket", table: "Search")
+            case FileAttributeType.typeCharacterSpecial.rawValue: kind = String(localized: "Character device", table: "Search")
+            case FileAttributeType.typeBlockSpecial.rawValue: kind = String(localized: "Block device", table: "Search")
+            default: kind = String(localized: "Unknown", table: "Search")
+            }
+            let size = Format.count((info["size"] as? NSNumber)?.uint64Value ?? 0)
+            let readable = info["readable"] as? Bool == true ? String(localized: "Yes", table: "Search") : String(localized: "No", table: "Search")
+            let writable = info["writable"] as? Bool == true ? String(localized: "Yes", table: "Search") : String(localized: "No", table: "Search")
+            let alert = NSAlert();alert.messageText = row.name
+            alert.informativeText = (info["size"] as? NSNumber)?.uint64Value == 1
+                ? String(localized: "Path: \(row.path)\nType: \(kind)\nSize: \(size) byte\nReadable: \(readable) · Writable: \(writable)", table: "Search")
+                : String(localized: "Path: \(row.path)\nType: \(kind)\nSize: \(size) bytes\nReadable: \(readable) · Writable: \(writable)", table: "Search")
+            alert.beginSheetModal(for:window!,completionHandler:nil)
+        } catch { NSApp.presentError(SiftText.error(error)) }
     }
     @objc func renameSelection(_ sender:Any?) {
         let rows = actionRows();guard rows.count == 1,let row = rows.first,!Prefs.dryRun("rename",[row.path]) else { return }
-        let alert = NSAlert();alert.messageText = "重命名";alert.informativeText = "在原文件夹内改名，不覆盖已有文件。"
+        let alert = NSAlert();alert.messageText = String(localized: "Rename", table: "Search");alert.informativeText = String(localized: "Rename this item in its current folder. Existing files will not be replaced.", table: "Search")
         let name = NSTextField(frame:NSRect(x:0,y:0,width:330,height:24));name.stringValue = row.name;alert.accessoryView = name
-        alert.addButton(withTitle:"重命名");alert.addButton(withTitle:"取消")
-        alert.beginSheetModal(for:window!) { [weak self] result in guard result == .alertFirstButtonReturn else { return };do { _ = try ProductFiles.rename(row.path,to:name.stringValue);self?.runSearch() } catch { NSApp.presentError(error) } }
+        alert.addButton(withTitle:String(localized: "Rename", table: "Search"));alert.addButton(withTitle:String(localized: "Cancel", table: "Search"))
+        alert.beginSheetModal(for:window!) { [weak self] result in guard result == .alertFirstButtonReturn else { return };do { _ = try ProductFiles.rename(row.path,to:name.stringValue);self?.runSearch() } catch { NSApp.presentError(SiftText.error(error)) } }
     }
     @objc func openWithSelection(_ sender:Any?) {
         let rows = actionRows();guard !rows.isEmpty,!Prefs.dryRun("open with",rows.map(\.path)) else { return }
-        let panel = NSOpenPanel();panel.title = "选择打开应用";panel.directoryURL = URL(fileURLWithPath:"/Applications");panel.canChooseFiles = true;panel.canChooseDirectories = false;panel.allowsMultipleSelection = false;panel.allowedContentTypes = [.applicationBundle]
-        panel.beginSheetModal(for:window!) { result in guard result == .OK,let application = panel.url else { return };NSWorkspace.shared.open(rows.map{URL(fileURLWithPath:$0.path)},withApplicationAt:application,configuration:NSWorkspace.OpenConfiguration()) { _,error in if let error { DispatchQueue.main.async { NSApp.presentError(error) } } } }
+        let panel = NSOpenPanel();panel.title = String(localized: "Choose an App to Open With", table: "Search");panel.directoryURL = URL(fileURLWithPath:"/Applications");panel.canChooseFiles = true;panel.canChooseDirectories = false;panel.allowsMultipleSelection = false;panel.allowedContentTypes = [.applicationBundle]
+        panel.beginSheetModal(for:window!) { result in guard result == .OK,let application = panel.url else { return };NSWorkspace.shared.open(rows.map{URL(fileURLWithPath:$0.path)},withApplicationAt:application,configuration:NSWorkspace.OpenConfiguration()) { _,error in if let error { DispatchQueue.main.async { NSApp.presentError(SiftText.error(error)) } } } }
     }
     @objc func exportResults(_ sender:Any?) {
         guard let results = model.results,!Prefs.dryRun("export results",[]) else { return }

@@ -4,6 +4,13 @@
     "search.folder": "在匹配的文件夹中…",
     "menu.settings": "设置…",
     "menu.history": "最近搜索",
-    "menu.reindex": "重建索引"
+    "menu.reindex": "重建索引",
+    "store.save.note": "有变化时按需保存；关闭后仍在退出时保存。",
+    "store.permissions.note": "通过系统文件夹选择面板授予搜索范围；登录项由 macOS 管理，不随配置迁移。",
+    "store.help.missing": "检查授权文件夹、排除规则、暂停状态和不完整索引提示；可重新选择文件夹、查看诊断或手动重建。macOS 保护的位置仍受系统限制。",
+    "store.help.compatibility": "Apple Silicon，macOS 14+。本版本通过 App Store 更新；可选 iCloud 配置同步和导入/导出在本窗口下方，索引与目录授权不随配置迁移。",
+    "store.help.privacy": "文件索引和最近搜索保存在本机，不上传给开发者。主动开启 iCloud 后，快捷键、常用搜索和包含/忽略规则等配置通过 Apple 同步；已保存查询和规则可能含你输入的名称或路径，文件索引和最近搜索不同步。本版本通过 App Store 更新。诊断默认不含范围路径和搜索历史。",
+    "store.access.explanation": "请选择允许索引的文件夹。macOS 另行保护的位置仍受系统限制。",
+    "store.access.panel": "请选择允许 Sift 索引的文件夹。可选择一个项目文件夹，或选择 {disk}；macOS 另行保护的位置仍受系统限制。"
   }
 }

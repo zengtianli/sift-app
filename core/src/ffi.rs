@@ -174,6 +174,11 @@ pub unsafe extern "C" fn sift_engine_details(engine: *const SiftEngine) -> *mut 
     to_c(&engine.service.status_json().to_string())
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn sift_engine_index_details(engine: *const SiftEngine) -> *mut c_char {
+    let Some(engine) = (unsafe { engine.as_ref() }) else { return ptr::null_mut(); };
+    to_c(&engine.service.index_status_json().to_string())
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn sift_remote_status(support_dir: *const c_char) -> *mut c_char {
     let directory = unsafe { opt_str(support_dir) }.map(std::path::PathBuf::from).unwrap_or_else(Config::default_support_dir);
     let request = crate::ipc::Request { op:"status".into(),..Default::default() };

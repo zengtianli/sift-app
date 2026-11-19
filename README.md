@@ -8,9 +8,9 @@
 
 ## 安装
 
-需要 Apple Silicon Mac 和 macOS 14 或更新版本。[下载正式 ZIP](https://github.com/zengtianli/sift-app/releases/download/v0.2.4/Sift-0.2.4-arm64.zip)；正式包已使用 Developer ID 签名，并完成 Apple 公证和装订。新版与校验文件以 [Releases](https://github.com/zengtianli/sift-app/releases) 的实际附件为准。
+需要 Apple Silicon Mac 和 macOS 14 或更新版本。从 [最新 Release](https://github.com/zengtianli/sift-app/releases/latest) 下载 ZIP 或 DMG；正式包已使用 Developer ID 签名，并完成 Apple 公证和装订，校验值见同一页的 `SHA256SUMS.txt`。
 
-下载 ZIP 后解压，将 `Sift.app` 放入「应用程序」。需要搜索受保护目录时，请本人在「系统设置 → 隐私与安全性 → 完全磁盘访问」中授权 Sift。
+解压 ZIP（或打开 DMG），将 `Sift.app` 放入「应用程序」。需要搜索受保护目录时，请本人在「系统设置 → 隐私与安全性 → 完全磁盘访问」中授权 Sift。
 
 命令行在 App 内，可自行建立软链：
 
@@ -39,7 +39,9 @@ Rust 工具链由 `core/rust-toolchain.toml` 指定；所需 Cardinal 分支源�
 
 文件名索引和索引配置保存在本机应用支持目录；最近搜索保存在本机偏好设置。全文内容不进入索引。全局快捷键由本人选择，默认不占用按键。可迁移设置支持导入、导出和可选的 iCloud 同步。
 
-公开快照使用独立的 `Sift` 云端目录命名空间，不包含作者的更新目录、索引、最近搜索、真实文件列表、截图或内部记录。目前保留本地 iCloud 更新机制，公开 GitHub 自动更新渠道尚未接入；新版以 Releases 为准。
+打开 iCloud 同步后，设置文件放在你自己 iCloud Drive 的 `TianliApps/Settings/` 下（作者各款 App 共用的目录名）。本仓源码与 Releases 里的安装包是同一份代码，版本与 build 号相同；不包含作者的索引、最近搜索、真实文件列表、截图或内部记录。
+
+「检查更新…」读取本仓 Releases 上的 `latest.json`（`Info.plist` 的 `AppUpdateFeedURL`），第一次打开默认每天检查一次，可在设置里关闭；自动下载、自动安装默认关闭。下载后核对 sha256、大小、包名、版本、签名团队与公证再替换。这是 App 唯一的联网操作：代码里的网络调用只在共享更新层（`Sources/Shared/AppLifecycle.swift` 的 `AppUpdateChecker` 读清单、`Sources/Shared/AppLifecycleUI.swift` 的 `AppUpgradeInstaller` 下载安装包），搜索、索引和 `sift` 命令行都不联网，命令行也不链接任何网络库。0.2.5 起生效；0.2.4 及更早的版本请从 Releases 手动下载一次新版。
 
 ## 许可证
 

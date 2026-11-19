@@ -14,13 +14,13 @@ enum Lifecycle {
     static let name = "Sift"
     static let command = "sift"
     static let productID = "cyou.tianli.sift"
-    /// The one release channel: the window's「检查更新」and `sift update check` both read it (packages iCloud Drive
-    /// already downloaded to this Mac; the app is built without a network client, see build.sh).
-    /// Kept as a labelled argument with the channel as a literal: Chapter finds a product's private channel by
-    /// that spelling in its sources (app_sop.private_update_channel) and compares the feed with the installed build.
+    /// The one release channel: the window's「检查更新」, the daily automatic check and `sift update check` all read it.
+    /// It is the HTTPS feed registered once in Info.plist (AppUpdateFeedURL: latest.json on the public GitHub
+    /// Releases of zengtianli/sift-app, the same place the public download lives), so a Mac without the owner's
+    /// iCloud gets updates too (shared AppUpdateFeed.swift). A build without that key falls back to the old private
+    /// iCloud channel. Chapter then asks the installed build which source it uses (app_sop.private_update_channel "").
     #if !APP_STORE
-    static let updateSource = release(updateSource: .privateCloud(channel: "default"))
-    private static func release(updateSource: AppUpdateSource) -> AppUpdateSource { updateSource }
+    static let updateSource: AppUpdateSource = AppUpdateFeed.source(fallback: .privateCloud(channel: "default"), bundle: hostBundle)
     #endif
     /// What travels with「导出配置…」and the optional iCloud copy: the window's three preferences and the index
     /// settings in config.json. Recent searches, the window frame, the login item and Full Disk Access stay per Mac.
@@ -152,6 +152,8 @@ enum Lifecycle {
     static func product(_ store: Store) -> AppLifecycleCLI.Product {
         var product = AppLifecycleCLI.Product(command: command, name: name, configuration: makeConfiguration(store), updateSource: updateSource)
         product.bundle = hostBundle
+        // Sift has its own Settings page (AppLifecycleUI.useSettings), so the shared window is 配置与更新… in its menu.
+        product.windowEntry = AppLifecycleCLI.updatesWindowEntry
         // `sift update install`: a running Sift saves its index when it quits, which can take a while on a big one.
         product.quitTimeout = 45
         product.canInstallUpdate = {

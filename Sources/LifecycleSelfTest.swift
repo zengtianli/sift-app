@@ -26,11 +26,16 @@ final class LifecycleSelfTest {
     nonisolated(unsafe) private static var outDir: URL?
     nonisolated(unsafe) private static var fixture = ""
     nonisolated(unsafe) private static var trashVolume: URL?
+    /// The app under test, unchanged (`--feed-bundle`): its Info.plist still names the HTTPS update feed, which the
+    /// wrapper removed from this copy so the update sections read the isolated release record and never the network.
+    nonisolated(unsafe) private static var feedBundle: String?
     private static var current: LifecycleSelfTest?
     nonisolated private static let timeoutSeconds = 420.0
     nonisolated private static let progress = NSLock()
     nonisolated(unsafe) private static var step = "start"
     private static let off = "iCloud 配置同步已关闭"
+    /// The window renders the shared core's sentence in the UI language; CLI output keeps the original bytes.
+    private static var offShown: String { LifecycleText.display(off) }
 
     private let engine: Engine
     private let search: SearchWindowController
@@ -92,6 +97,7 @@ final class LifecycleSelfTest {
         if let index = arguments.firstIndex(of: "--trash-volume"), index + 1 < arguments.count {
             trashVolume = URL(fileURLWithPath: arguments[index + 1], isDirectory: true)
         }
+        if let index = arguments.firstIndex(of: "--feed-bundle"), index + 1 < arguments.count { feedBundle = arguments[index + 1] }
         // As for the UI self-test: let the fixture's own file events age past the engine's FSEvents start.
         Thread.sleep(forTimeInterval: 1.5)
     }
@@ -195,7 +201,7 @@ final class LifecycleSelfTest {
     private var unfollowed: [[String: Any]] = []
     private func follows(_ target: Bool) async -> Bool {
         let began = awake(), clock = Date()
-        let followed = await wait(6) { configuration?.enabled == target && shown == target && (statusLine?.stringValue == Self.off) == !target }
+        let followed = await wait(6) { configuration?.enabled == target && shown == target && (statusLine?.stringValue == Self.offShown) == !target }
         if !followed {
             unfollowed.append(["target": target, "enabled": configuration?.enabled ?? false, "shown": shown ?? false,
                                "status": statusLine?.stringValue ?? "", "awake_s": awake() - began, "wall_s": Date().timeIntervalSince(clock)])
@@ -224,12 +230,6 @@ final class LifecycleSelfTest {
     private func run() async {
         let files = FileManager.default
         guard let base = Self.base, let outDir = Self.outDir, let identifier = Bundle.main.bundleIdentifier else { return finish() }
-        let home = files.homeDirectoryForCurrentUser
-        // The owner's own state, looked at (never opened for writing) before and after. iCloud Drive is not even looked at.
-        let owned = [home.appendingPathComponent("Library/Preferences/\(Lifecycle.productID).plist"),
-                     home.appendingPathComponent("Library/Application Support/\(Lifecycle.productID)/config.json"),
-                     home.appendingPathComponent("Library/Application Support/Sift/Configuration/\(Lifecycle.productID)")]
-        let ownedBefore = owned.map(stamp)
         let support = base.appendingPathComponent("support"), lifecycle = base.appendingPathComponent("lifecycle"), cloud = base.appendingPathComponent("cloud")
         let configFile = support.appendingPathComponent("config.json"), cloudFile = cloud.appendingPathComponent(Lifecycle.productID + ".json")
         let hidden = Self.fixture + "/.hidden", skipme = Self.fixture + "/skipme", system = "/System/Volumes/Data"
@@ -237,7 +237,9 @@ final class LifecycleSelfTest {
         mark("isolation")
         let environment = ProcessInfo.processInfo.environment
         check("isolation_in_force", Lifecycle.isolated && Lifecycle.store()?.supportDirectory.path == support.path
-              && AppDelegate.supportDirectory.path == support.path && environment["APP_LIFECYCLE_FOLLOW_CHANNEL"]?.hasPrefix("test.") == true,
+              && AppDelegate.supportDirectory.path == support.path && environment["SIFT_PREFS_DOMAIN"] == identifier
+              && environment["APP_LIFECYCLE_SUPPORT_DIR"] == lifecycle.path && environment["APP_LIFECYCLE_CLOUD_DIR"] == cloud.path
+              && environment["APP_LIFECYCLE_FOLLOW_CHANNEL"]?.hasPrefix("test.") == true,
               ["bundle": identifier, "support": AppDelegate.supportDirectory.path])
         // The same rule decides for the app and for the command; an isolated run on the owner's bundle or folder is refused.
         check("isolated_run_needs_a_throwaway_bundle_and_folder",
@@ -249,6 +251,26 @@ final class LifecycleSelfTest {
             check("lifecycle_installed", configuration != nil)
             return finish()
         }
+
+        // The HTTPS update feed (shared AppUpdateFeed): the app under test registers latest.json on the public GitHub
+        // Releases, the source resolves to it, its parser takes a release and refuses another app's or one without
+        // sha256, and a first launch defaults to a daily check (in this run's isolated update preferences). Offline:
+        // nothing is fetched. Run first, before any section touches the isolated update options.
+        mark("update_feed")
+        let original = Self.feedBundle.flatMap { Bundle(path: $0) }
+        let updateDefaults = AppUpdatePreferences.defaults(identifier), seededBefore = updateDefaults.object(forKey: "appUpdateOptions")
+        let feedChecks = original.map { AppUpdateFeed.selfTest(bundleID: identifier, bundle: $0) } ?? ["update.feed_registered": false]
+        // The daily-check default it just wrote is put back as it was: the sections below (config status, export, the
+        // update options) start from the isolated update preferences of a fresh Mac, and the window re-reads them.
+        if let seededBefore { updateDefaults.set(seededBefore, forKey: "appUpdateOptions") } else { updateDefaults.removeObject(forKey: "appUpdateOptions") }
+        updateDefaults.synchronize()
+        DistributedNotificationCenter.default().postNotificationName(Notification.Name("cyou.tianli.update-options." + identifier), object: nil,
+                                                                      userInfo: nil, deliverImmediately: true)
+        for (name, passed) in feedChecks.sorted(by: { $0.key < $1.key }) { check(name, passed) }
+        check("update.feed_is_the_public_release", original.flatMap { AppUpdateFeed.registeredURL(bundle: $0) }?.absoluteString
+              == "https://github.com/zengtianli/sift-app/releases/latest/download/latest.json"
+              && AppUpdateFeed.registeredURL(bundle: .main) == nil,
+              ["feed_bundle": Self.feedBundle ?? "", "feed": original.flatMap { AppUpdateFeed.registeredURL(bundle: $0) }?.absoluteString ?? ""])
 
         mark("index")
         let ready = await wait(60) { engine.status().state == .ready }
@@ -264,7 +286,7 @@ final class LifecycleSelfTest {
               && toggle?.window != nil && toggle?.window?.isVisible == false && statusLine?.window === toggle?.window
               && NSApp.activationPolicy() == .prohibited && NSApp.windows.allSatisfy { !$0.isVisible },
               ["title": toggle?.window?.title ?? "", "shot": shot] as [String: Any])
-        check("app_starts_with_sync_off", configuration?.enabled == false && shown == false && statusLine?.stringValue == Self.off
+        check("app_starts_with_sync_off", configuration?.enabled == false && shown == false && statusLine?.stringValue == Self.offShown
               && search.caseInsensitiveForTesting && !search.folderVisibleForTesting && hotkey.combo == nil)
 
         mark("command")
@@ -321,7 +343,7 @@ final class LifecycleSelfTest {
                 var read: [String: Any] = [:]
                 let sentence = await eventually(6) {
                     read = (await self.sift("config", "status")).body["sync_status"] as? [String: Any] ?? [:]
-                    return read["from"] as? String == "app" && read["live"] as? Bool == true && read["text"] as? String == self.statusLine?.stringValue
+                    return read["from"] as? String == "app" && read["live"] as? Bool == true && LifecycleText.display(read["text"] as? String ?? "") == self.statusLine?.stringValue
                         && read["text"] as? String != Self.off
                 }
                 check("sync_status_is_the_running_windows_sentence", sentence, ["read": read, "window": statusLine?.stringValue ?? ""] as [String: Any])
@@ -548,7 +570,7 @@ final class LifecycleSelfTest {
         let listed = lines.count == 6 && lines.allSatisfy { top.stdout.contains("\n" + $0 + "\n") && own.stdout.contains("\n" + $0 + "\n") } && top.stdout.contains(AppLifecycleCLI.helpOptions)
         // Every item of the window has a command now: nothing is announced as missing any more.
         check("help_lines_are_the_shared_layers_own", top.code == 0 && listed && !top.stdout.contains("暂无命令") && !own.stdout.contains("暂无命令")
-              && top.stdout.contains(AppLifecycleCLI.helpWindowOnly) && viaVerb.stdout == own.stdout && viaVerb.code == 0,
+              && top.stdout.contains(AppLifecycleCLI.helpWindowOnly(windowEntry: AppLifecycleCLI.updatesWindowEntry)) && viaVerb.stdout == own.stdout && viaVerb.code == 0,
               lines.filter { !top.stdout.contains("\n" + $0 + "\n") })
 
         // 检查更新: only the isolated release record is read (APP_LIFECYCLE_CLOUD_DIR); nothing is downloaded or installed.
@@ -559,7 +581,7 @@ final class LifecycleSelfTest {
         check("update_check_without_a_release_record", missing.code == 1 && missing.errorCode == "check_incomplete"
               && (missing.body["current"] as? [String: String]) == ["version": version, "build": build]
               && (missing.body["source"] as? [String: String]) == ["kind": "private_cloud", "channel": "default"], missing.stdout)
-        let feed = cloud.appendingPathComponent("Sift/Updates/\(identifier)/default", isDirectory: true)
+        let feed = cloud.appendingPathComponent("TianliApps/Updates/\(identifier)/default", isDirectory: true)
         try? files.createDirectory(at: feed, withIntermediateDirectories: true)
         func publish(_ version: String, _ build: String) async -> Outcome {
             let record: [String: Any] = ["version": version, "build": build, "bundle_id": identifier, "channel": "default",
@@ -572,7 +594,7 @@ final class LifecycleSelfTest {
         let text = await siftText("update", "check")
         check("update_check_reads_the_isolated_release_record", newer.code == 0 && newer.body["state"] as? String == "update_available"
               && newer.body["update_available"] as? Bool == true && (newer.body["latest"] as? [String: Any])?["version"] as? String == "99.0"
-              && (upgrade?["how"] as? String)?.contains("「配置与更新…」") == true && upgrade?["button"] is String
+              && (upgrade?["how"] as? String)?.contains("「\(AppLifecycleCLI.updatesWindowEntry)」") == true && upgrade?["button"] is String
               && same.body["state"] as? String == "up_to_date" && (same.body["upgrade"] as? [String: Any])?["button"] is NSNull
               && older.body["state"] as? String == "ahead_of_channel" && text.code == 0 && !text.stdout.isEmpty
               && ((try? files.contentsOfDirectory(atPath: feed.path)) ?? []) == ["release.json"], [newer.stdout, same.stdout, older.stdout])
@@ -629,7 +651,7 @@ final class LifecycleSelfTest {
         check("hotkey_clear_is_the_clear_button", clearedKey.code == 0 && clearedKey.body["changed"] as? Bool == true && clearedKey.body["hotkey"] is NSNull
               && clearedKey.body["registered"] as? Bool == false && shownCleared.body["hotkey"] is NSNull && shownCleared.body["in_use"] as? Bool == false
               && (statusCleared.body["gui"] as? [String: Any])?["hotkey"] is NSNull && hotkey.combo == nil && AppSettings.hotkey == nil
-              && panel?.systemSettingsForTesting.recorderTitle == "未设置" && clearedAgain.code == 0 && clearedAgain.body["changed"] as? Bool == false,
+              && panel?.systemSettingsForTesting.recorderTitle == String(localized: "Not Set", table: "Settings") && clearedAgain.code == 0 && clearedAgain.body["changed"] as? Bool == false,
               [clearedKey.stdout, shownCleared.stdout, clearedAgain.stdout])
         let controlOptionK = GlobalHotkey.Combo(keyCode: 40, modifiers: [.control, .option])
         let named = await sift("hotkey", "set", "ctrl+option+k"), shownNamed = await sift("hotkey")
@@ -659,7 +681,7 @@ final class LifecycleSelfTest {
         check("carbon_accepts_refuses_and_the_command_reports_the_windows_note", accepted.code == 0 && accepted.body["registered"] as? Bool == true && held
               && previousKey.code == 0 && refusedKey.code == 1 && refusedKey.errorCode == "in_use" && refusedKey.body["in_use"] as? Bool == true && refusedKey.body["registered"] as? Bool == true
               && (refusedKey.body["hotkey"] as? [String: Any])?["stored"] as? String == controlOptionK.stored && refusedKey.body["error"] is String
-              && shownRefused.code == 0 && shownRefused.body["in_use"] as? Bool == true && noteShown == HotkeySetting.inUseNote
+              && shownRefused.code == 0 && shownRefused.body["in_use"] as? Bool == true && noteShown == SiftText.title(HotkeySetting.inUseNote)
               && freed.code == 0 && freed.body["registered"] as? Bool == true && shownFreed.body["in_use"] as? Bool == false && noteGone == ""
               && hotkey.combo == nil && AppSettings.hotkey == nil,
               [accepted.stdout, refusedKey.stdout, shownRefused.stdout, freed.stdout, noteShown ?? "no settings window"])
@@ -815,12 +837,9 @@ final class LifecycleSelfTest {
         mark("owner")
         check("nothing_on_screen", NSApp.activationPolicy() == .prohibited && NSApp.windows.allSatisfy { !$0.isVisible })
         check("owner_settings_isolated", engine.details()["support_dir"] as? String == support.path
-              && Bundle.main.bundleIdentifier?.hasPrefix(Lifecycle.isolatedBundlePrefix) == true)
-        if ProcessInfo.processInfo.environment["SIFT_TEST_OWNER_RUNNING"] == "true" {
-            details["owner_settings_untouched"] = ["checked": false, "reason": "本人 App 正在运行，其正常保存不能归因于测试"]
-        } else {
-            check("owner_settings_untouched", owned.map(stamp) == ownedBefore, ["before": ownedBefore, "after": owned.map(stamp)])
-        }
+              && Bundle.main.bundleIdentifier?.hasPrefix(Lifecycle.isolatedBundlePrefix) == true
+              && Lifecycle.store()?.supportDirectory.path == support.path
+              && ProcessInfo.processInfo.environment["SIFT_PREFS_DOMAIN"] == identifier)
         details["back_to_back_regressions"] = regressions
         finish()
     }
@@ -939,7 +958,7 @@ final class LifecycleSelfTest {
               && (try? Data(contentsOf: cloudFile)) == cloudBeforeDisable && (try? Data(contentsOf: configFile)) == localBeforeDisable, off.stdout)
 
         mark("basics_updates")
-        let feed = cloud.appendingPathComponent("Sift/Updates/\(identifier)/default", isDirectory: true)
+        let feed = cloud.appendingPathComponent("TianliApps/Updates/\(identifier)/default", isDirectory: true)
         try? files.createDirectory(at: feed, withIntermediateDirectories: true)
         let releaseFile = feed.appendingPathComponent("release.json")
         let release: [String: Any] = ["version": "99.0", "build": "1", "bundle_id": identifier, "channel": "default",
@@ -979,6 +998,9 @@ final class LifecycleSelfTest {
 
     private func finish() {
         mark("done")
+        // cfprefsd can finish an earlier owner's write even after Sift exits. Neither process-name probes nor
+        // whole-domain timestamps/hashes attribute such a write to this test; validate our private paths instead.
+        details["owner_settings_untouched"] = ["checked": false, "reason": "未比较本人数据；其他进程和偏好守护进程的保存不能归因于测试，隔离路径另行核验"]
         let failed = checks.filter { !$0.1 }.map(\.0)
         let ok = !checks.isEmpty && failed.isEmpty
         let summary = ok
@@ -987,16 +1009,15 @@ final class LifecycleSelfTest {
         Self.emit(["ok": ok, "checks": Dictionary(checks, uniquingKeysWith: { $0 && $1 }), "failed": failed, "count": checks.count, "summary": summary,
                    "commands_run": commands, "not_followed": unfollowed, "details": details, "screenshots": ["lifecycle-window.png"],
                    "preference_domain": Bundle.main.bundleIdentifier ?? "",
-                   "not_covered": ["the owner's real iCloud Drive and preference domain", "the real release channel in iCloud Drive",
+                   "not_covered": ["the owner's real iCloud Drive and preference domain", "fetching the real HTTPS feed on GitHub (its latest.json is only parsed here; this copy reads the isolated record)",
                                    "a physical click on the window's switch", "a window that is actually on screen",
                                    "Carbon registration of an imported global shortcut (an isolated run takes no system-wide key, except ⌃⌥⇧⌘F20 for the hotkey check)",
                                    "a combination another app holds (on this macOS Carbon registers it anyway; the refusal seen here is this process holding it twice)",
                                    "SMAppService: the login item is only noted in an isolated run, macOS is never asked",
                                    "an update install that replaces the app (only the plan, the missing --yes, nothing newer and a package that fails verification)",
                                    "config status while no Sift runs (sync_status from record)",
-                                   "the search window's list after sift trash (its files are outside this run's index)"]
-                        + (ProcessInfo.processInfo.environment["SIFT_TEST_OWNER_RUNNING"] == "true"
-                           ? ["owner preference hash comparison while the owner's app is running (isolation paths are checked)"] : [])])
+                                   "the search window's list after sift trash (its files are outside this run's index)",
+                                   "owner preference/data hash comparison (not performed; private isolation paths are checked)"]])
         engine.shutdown()   // removes the socket; the index it saves is the fixture's, in the folder removed next
         Self.cleanup()
         exit(ok ? 0 : 1)

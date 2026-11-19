@@ -45,7 +45,7 @@ const BUNDLE_ID: &str = "cyou.tianli.sift";
 macro_rules! lifecycle_reads {
     () => {
         "  config status              「使用 iCloud 记住配置」开关、开关下面那句同步状态、当前可迁移的配置项、App 是否在运行（只读）
-  update check               检查更新：当前版本、此渠道最新版本、有没有新版、怎么升级（不改配置或安装；记录本机检查结果；私有渠道读 iCloud Drive 里的发行记录，公开渠道联网读发行记录）"
+  update check               检查更新：当前版本、此渠道最新版本、有没有新版、怎么升级（只读：不改配置、不安装、不记录检查结果；私有渠道读 iCloud Drive 里的发行记录，公开渠道联网读发行记录）"
     };
 }
 macro_rules! lifecycle_writes {
@@ -109,6 +109,7 @@ login-item on|off always print one JSON line (--json is accepted).
                state, repairing, results:[{path, kind, size, mtime, ctime}], loosened?:actual_query}
               loosened is present only when a zero-result strict query found rows after expansion
   status      {ok, running, live, state, files, events, walks, rebuild_required, repairing,
+               repair_failed, history_losses, history_replays, pending_event_batches,
                root, ignore_paths, include_paths, full_disk_access, login_item, app, pid,
                gui:{case_insensitive, show_folder_scope, hotkey}}; while Sift is not
                running: {ok:true, running:false, exit:3, snapshot, root, …, gui}
@@ -157,8 +158,8 @@ login-item on|off always print one JSON line (--json is accepted).
 Whether Sift runs: key on the exit code (3) or `running`, not on `ok` (`status`
 still reports the saved index with ok:true, running:false, exit:3).
 Socket permission/sandbox denial instead returns {ok:false, code:socket_blocked,
-exit:2, error:reason}, with no running field; start does not relaunch. Retry with
-~/Dev/tools/dev/lib/tools/cc/guarded-bin/outside-guard -- sift <command>.
+exit:2, error:reason}, with no running field; start does not relaunch. Retry the
+same command from a process allowed to reach the socket (outside that sandbox or guard).
 
 EXIT CODES:
   0  ok / results found (update install with nothing newer: 0, installed false)
@@ -492,8 +493,9 @@ settings, and a config.json changed behind its back would leave the saved index
 unreadable for --offline until a rebuild. `config sync off`, `config status`,
 `config export` and `update check` work whether or not Sift runs.
 
-`update check` reads the release record of Sift's private channel in iCloud Drive
-(the terminal may be asked once for access to iCloud Drive). Nothing is downloaded or
+`update check` reads Sift's release record over HTTPS: latest.json on the public GitHub
+Releases of zengtianli/sift-app (Info.plist AppUpdateFeedURL; `source` names it). A build
+without that key reads its private channel in iCloud Drive instead. Nothing is downloaded or
 installed; `upgrade.command` and `upgrade.how` say how to upgrade.
 
 `update install --yes` is the window's 升级到新版…: the same lookup, then the release
@@ -1068,6 +1070,8 @@ fn status(args: &[String]) -> Result<u8> {
             let reason = v["rebuild_reason"].as_str().unwrap_or_default();
             println!("rebuild required: {}{}", yes(&v["rebuild_required"]), if reason.is_empty() { String::new() } else { format!(" ({})", reason.lines().last().unwrap_or(reason)) });
             println!("background repair running: {}", yes(&v["repairing"]));
+            println!("event batches not yet applied: {}", v["pending_event_batches"]);
+            println!("history losses: {} (recovered by replay: {})", v["history_losses"], v["history_replays"]);
             println!("root: {}", v["root"].as_str().unwrap_or("?"));
             println!("skipped folders: {}, included folders: {}", v["ignore_paths"].as_array().map_or(0, Vec::len), v["include_paths"].as_array().map_or(0, Vec::len));
             println!("full disk access: {}", yes(&v["full_disk_access"]));

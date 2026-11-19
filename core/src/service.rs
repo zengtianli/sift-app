@@ -152,9 +152,9 @@ impl Service {
         })
     }
 
-    /// Everything the window's status bar and Settings show, as one JSON object.
-    /// Key names up to `now` are a stable contract (Chapter's readiness check parses them).
-    pub fn status_json(&self) -> Value {
+    /// Index facts for frequent UI refreshes. No ServiceManagement XPC, TCC file
+    /// probe or bundle filesystem reads; explicit CLI/settings status stays live.
+    pub fn index_status_json(&self) -> Value {
         let s = &self.engine.status;
         let config = self.config();
         json!({
@@ -170,6 +170,10 @@ impl Service {
             "rebuild_required": s.rebuild_required.load(Ordering::Relaxed),
             "rebuild_reason": *s.rebuild_reason.lock().unwrap(),
             "repairing": s.repairing.load(Ordering::Relaxed),
+            "repair_failed": s.repair_failed.load(Ordering::Relaxed),
+            "history_losses": s.history_losses.load(Ordering::Relaxed),
+            "history_replays": s.history_replays.load(Ordering::Relaxed),
+            "pending_event_batches": s.pending_event_batches.load(Ordering::Relaxed),
             "paused": s.paused.load(Ordering::Relaxed),
             "auto_repair": s.auto_repair.load(Ordering::Relaxed),
             "auto_snapshot": s.auto_snapshot.load(Ordering::Relaxed),
@@ -183,11 +187,17 @@ impl Service {
             "ignore_paths": config.ignore_paths,
             "include_paths": config.include_paths,
             "support_dir": config.support_dir,
-            "full_disk_access": has_full_disk_access(),
-            "login_item": self.login_item(),
-            "app": std::env::current_exe().ok().and_then(|exe| bundle_info(&exe)),
             "now": unix_now(),
         })
+    }
+
+    /// Full public status contract, including current permissions and login item.
+    pub fn status_json(&self) -> Value {
+        let mut out = self.index_status_json();
+        out["full_disk_access"] = json!(has_full_disk_access());
+        out["login_item"] = json!(self.login_item());
+        out["app"] = json!(std::env::current_exe().ok().and_then(|exe| bundle_info(&exe)));
+        out
     }
 
     fn login_item(&self) -> Option<&'static str> {
@@ -229,13 +239,30 @@ impl Service {
 /// Full Disk Access, probed by reading one byte of a TCC-protected file. TCC judges
 /// the calling process, so only the app's own answer (over the socket) means
 /// "Sift has access"; the window's footer button uses the same probe.
+///
+/// Several candidates, because Apple moves these files: on macOS 27 the per-user
+/// TCC.db left `~/Library/Application Support/com.apple.TCC/` for a ProtectedSystem
+/// container, and probing only that path reported "no access" with access granted.
+/// A missing candidate says nothing and the next one is tried; a candidate that
+/// exists but cannot be read is the denial.
 pub fn has_full_disk_access() -> bool {
-    let Some(home) = std::env::var_os("HOME") else { return false };
-    let probe = Path::new(&home).join("Library/Application Support/com.apple.TCC/TCC.db");
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut probes = vec![PathBuf::from("/Library/Application Support/com.apple.TCC/TCC.db")];
+    if let Some(home) = &home {
+        probes.push(home.join("Library/Application Support/com.apple.TCC/TCC.db"));
+        probes.push(home.join("Library/Safari/Bookmarks.plist"));
+    }
+    probes.iter().find_map(|path| probe_protected(path)).unwrap_or(false)
+}
+
+/// `Some(true)` readable, `Some(false)` present but denied, `None` absent.
+fn probe_protected(path: &Path) -> Option<bool> {
     let mut byte = [0u8; 1];
-    std::fs::File::open(probe)
-        .and_then(|mut f| f.read(&mut byte))
-        .is_ok_and(|n| n == 1)
+    match std::fs::File::open(path).and_then(|mut f| f.read(&mut byte)) {
+        Ok(n) => Some(n == 1),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(false),
+    }
 }
 
 /// Version facts of the `.app` that contains `exe` (the app's own executable, or
@@ -272,7 +299,23 @@ fn plist_string(xml: &str, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::plist_string;
+    use super::{plist_string, probe_protected};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_missing_probe_file_is_no_answer_and_a_denied_one_is_no_access() {
+        let dir = std::env::temp_dir().join(format!("sift-fda-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let readable = dir.join("readable");
+        let denied = dir.join("denied");
+        std::fs::write(&readable, b"x").unwrap();
+        std::fs::write(&denied, b"x").unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(probe_protected(&dir.join("absent")), None);
+        assert_eq!(probe_protected(&readable), Some(true));
+        assert_eq!(probe_protected(&denied), Some(false));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn reads_strings_from_an_xml_info_plist() {

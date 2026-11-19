@@ -19,12 +19,15 @@ APP="$STAGE/Sift.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin"
 cp Info.plist "$APP/Contents/Info.plist"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/"
-cp Resources/UI.zh-Hans.json "$APP/Contents/Resources/"
+cp Resources/UI.*.json "$APP/Contents/Resources/"
+for CATALOG in Resources/*.xcstrings; do
+  xcrun xcstringstool compile "$CATALOG" --output-directory "$APP/Contents/Resources"
+done
 SOURCES=()
 while IFS= read -r line; do SOURCES+=("$line"); done < <(find Sources -type f -name '*.swift' | LC_ALL=C sort)
 xcrun swiftc -swift-version 5 -O -whole-module-optimization -target arm64-apple-macos14.0 \
   -file-prefix-map "$HOME=/build" -file-prefix-map "$DIR=." \
-  -D APP_LIFECYCLE_LOCAL_ONLY -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
+  -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
   -I core/include -L "$TARGET_DIR/release" -Xlinker -dead_strip \
   -framework CoreServices -framework Carbon -framework Quartz \
   "${SOURCES[@]}" -o "$APP/Contents/MacOS/Sift"

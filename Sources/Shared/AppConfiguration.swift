@@ -30,6 +30,17 @@ final class AppConfiguration: NSObject {
     private let validateDefault: ((String, Any) throws -> Void)?
     private let files: [AppConfigurationFile]
     private let defaults: UserDefaults
+    /// appUpdateOptions lives where AppUpdatePreferences keeps it: in an isolated run (APP_LIFECYCLE_SUPPORT_DIR) that is the
+    /// run's derived domain, so `update options` and `config export/import` read and write the same place (mackit 2026-11-08).
+    /// Store editions compile this file without AppLifecycle.swift (no updater, so no appUpdateOptions): plain defaults.
+    private func store(_ key: String) -> UserDefaults {
+        #if APP_STORE
+        return defaults
+        #else
+        guard key == "appUpdateOptions", AppUpdatePreferences.isolatedDomain() != nil else { return defaults }
+        return AppUpdatePreferences.defaults(Bundle.main.bundleIdentifier ?? "")
+        #endif
+    }
     private let worker = DispatchQueue(label: "cyou.tianli.configuration", qos: .utility)
     private var observers: [NSObjectProtocol] = []
     private let localLock = NSRecursiveLock()
@@ -85,7 +96,7 @@ final class AppConfiguration: NSObject {
             localDirectory = URL(fileURLWithPath: p, isDirectory: true).appendingPathComponent(productID, isDirectory: true)
         } else {
             localDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent("Sift/Configuration/" + productID, isDirectory: true)
+                .appendingPathComponent("TianliApps/Configuration/" + productID, isDirectory: true)
         }
         super.init()
         if enabled { status = "等待 iCloud 配置同步" }
@@ -229,7 +240,7 @@ final class AppConfiguration: NSObject {
         _ = defaults.synchronize()
         var values: [String: Any] = [:]
         for key in defaultsKeys {
-            if let value = defaults.object(forKey: key) { values["defaults." + key] = try Self.pack(value) }
+            if let value = store(key).object(forKey: key) { values["defaults." + key] = try Self.pack(value) }
         }
         for (index, file) in files.enumerated() {
             guard FileManager.default.fileExists(atPath: file.url.path) else { continue }
@@ -305,8 +316,8 @@ final class AppConfiguration: NSObject {
             }
             throw error
         }
-        for key in defaultsKeys { if let value = prefs[key] { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) } }
-        _ = defaults.synchronize()
+        for key in defaultsKeys { if let value = prefs[key] { store(key).set(value, forKey: key) } else { store(key).removeObject(forKey: key) } }
+        _ = defaults.synchronize(); _ = store("appUpdateOptions").synchronize()
         DispatchQueue.main.async { [weak self] in self?.onChange?() }
     }
 
@@ -356,7 +367,7 @@ final class AppConfiguration: NSObject {
         #if os(macOS) && !APP_LIFECYCLE_KVS
         let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs", isDirectory: true)
         guard FileManager.default.ubiquityIdentityToken != nil, FileManager.default.fileExists(atPath: root.path), FileManager.default.isUbiquitousItem(at: root) else { return nil }
-        return root.appendingPathComponent("Sift/Settings/" + productID + ".json")
+        return root.appendingPathComponent("TianliApps/Settings/" + productID + ".json")
         #else
         return nil
         #endif

@@ -95,7 +95,11 @@ pub struct RecoverySchedule {
 
 impl RecoverySchedule {
     /// `host_busy` is the machine's CPU share over the last tick (`None` = unknown).
-    pub fn due(&mut self, now: Instant, pending: bool, idle: Duration, host_busy: Option<f64>) -> bool {
+    /// A repair walks on two background-QoS threads while the loop keeps answering
+    /// from the old snapshot, so it does not wait for the user to stop searching:
+    /// it starts on the first tick after the loss unless the Mac is busy or a
+    /// previous attempt is still backing off.
+    pub fn due(&mut self, now: Instant, pending: bool, host_busy: Option<f64>) -> bool {
         if !pending {
             self.first_pending = None;
             // A sustained healthy period resets the retry sequence.
@@ -105,9 +109,7 @@ impl RecoverySchedule {
             return false;
         }
         let waited = now.duration_since(*self.first_pending.get_or_insert(now));
-        idle >= Duration::from_secs(60)
-            && waited >= Duration::from_secs(30)
-            && (host_busy.is_none_or(|busy| busy < HOST_BUSY) || waited >= MAX_DEFER)
+        (host_busy.is_none_or(|busy| busy < HOST_BUSY) || waited >= MAX_DEFER)
             && self.last_attempt.is_none_or(|t| now.duration_since(t) >= Self::delay(self.attempts))
     }
 
@@ -152,35 +154,34 @@ impl Drop for BackgroundPriority {
 mod tests {
     use super::*;
     #[test]
-    fn recovery_waits_for_idle_and_backs_off_without_losing_pending_work() {
+    fn recovery_starts_at_once_and_backs_off_without_losing_pending_work() {
         let t = Instant::now();
         let mut schedule = RecoverySchedule::default();
-        assert!(!schedule.due(t, true, Duration::from_secs(90), None));
-        assert!(!schedule.due(t + Duration::from_secs(30), true, Duration::from_secs(59), None));
-        assert!(schedule.due(t + Duration::from_secs(60), true, Duration::from_secs(60), None));
-        schedule.attempted(t + Duration::from_secs(60));
-        assert!(!schedule.due(t + Duration::from_secs(120), true, Duration::from_secs(120), None));
-        assert!(!schedule.due(t + Duration::from_secs(359), true, Duration::from_secs(359), None));
-        assert!(schedule.due(t + Duration::from_secs(360), true, Duration::from_secs(360), None));
-        schedule.attempted(t + Duration::from_secs(360));
-        assert!(!schedule.due(t + Duration::from_secs(400), true, Duration::from_secs(400), None));
-        assert!(!schedule.due(t + Duration::from_secs(959), true, Duration::from_secs(959), None));
-        assert!(schedule.due(t + Duration::from_secs(960), true, Duration::from_secs(960), None));
-        assert!(!schedule.due(t + Duration::from_secs(961), false, Duration::from_secs(961), None));
+        assert!(!schedule.due(t, false, None));
+        assert!(schedule.due(t, true, None));
+        schedule.attempted(t);
+        assert!(!schedule.due(t + Duration::from_secs(60), true, None));
+        assert!(!schedule.due(t + Duration::from_secs(299), true, None));
+        assert!(schedule.due(t + Duration::from_secs(300), true, None));
+        schedule.attempted(t + Duration::from_secs(300));
+        assert!(!schedule.due(t + Duration::from_secs(899), true, None));
+        assert!(schedule.due(t + Duration::from_secs(900), true, None));
+        assert!(!schedule.due(t + Duration::from_secs(901), false, None));
     }
 
     #[test]
     fn recovery_waits_while_the_mac_is_busy_but_not_forever() {
         let t = Instant::now();
-        let idle = Duration::from_secs(600);
         let mut schedule = RecoverySchedule::default();
-        assert!(!schedule.due(t, true, idle, Some(0.1)));
+        assert!(schedule.due(t, true, Some(0.1)));
+        let mut schedule = RecoverySchedule::default();
+        assert!(!schedule.due(t, true, Some(0.6)));
         // The 2026-09-29 incidents started with the host at 70-99% CPU.
-        assert!(!schedule.due(t + Duration::from_secs(60), true, idle, Some(0.77)));
-        assert!(!schedule.due(t + Duration::from_secs(90), true, idle, Some(HOST_BUSY)));
-        assert!(schedule.due(t + Duration::from_secs(120), true, idle, Some(0.3)));
-        assert!(!schedule.due(t + Duration::from_secs(29 * 60), true, idle, Some(0.99)));
-        assert!(schedule.due(t + Duration::from_secs(30 * 60), true, idle, Some(0.99)));
+        assert!(!schedule.due(t + Duration::from_secs(60), true, Some(0.77)));
+        assert!(!schedule.due(t + Duration::from_secs(90), true, Some(HOST_BUSY)));
+        assert!(schedule.due(t + Duration::from_secs(120), true, Some(0.3)));
+        assert!(!schedule.due(t + Duration::from_secs(29 * 60), true, Some(0.99)));
+        assert!(schedule.due(t + Duration::from_secs(30 * 60), true, Some(0.99)));
     }
 
     #[test]

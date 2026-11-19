@@ -134,7 +134,7 @@ fn top_level_help_is_the_agent_contract() {
     }
     for part in ["READ COMMANDS", "WRITE COMMANDS", "--json", "EXIT CODES:", "WINDOW ONLY", "仅在窗口中",
                  "\"ok\":false", "  3  Sift.app is not running", "Show in Finder", "Quick Look", "Recording the global shortcut",
-                 "Full Disk Access", "loosened?:actual_query", "socket_blocked", "outside-guard -- sift"] {
+                 "Full Disk Access", "loosened?:actual_query", "socket_blocked", "outside that sandbox or guard"] {
         assert!(help.contains(part), "top-level help lacks {part:?}");
     }
     // The 配置与更新… window's commands: each at the start of a line, as the shared layer words them.
@@ -318,7 +318,9 @@ fn socket_denial_is_an_error_and_never_starts_another_app() {
         assert_eq!(v["code"], "socket_blocked");
         assert_eq!(v["exit"], 2);
         assert!(v.get("running").is_none() && v.get("started").is_none() && v.get("would_run").is_none(), "{v}");
-        assert!(v["error"].as_str().unwrap().contains("outside-guard -- sift"));
+        let error = v["error"].as_str().unwrap();
+        // The hint is for anyone's Mac: no path from the author's machine.
+        assert!(error.contains("outside that sandbox or guard") && !error.contains("~/"), "{error}");
         assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     }
     drop(listener);

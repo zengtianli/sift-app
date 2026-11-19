@@ -63,7 +63,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         #endif
         NSApp.mainMenu = buildMenu()
-        if !Prefs.readOnly, !Prefs.headless { SiftShortcuts.shared.reload();updateMenuBar() }
+        if !Prefs.readOnly, !Prefs.headless {
+            SiftShortcuts.shared.reload();updateMenuBar()
+            // The shared layer attaches 设置… once the new main menu is in place (queued by that assignment); then
+            // give it the 打开设置 binding the person chose.
+            DispatchQueue.main.async { SiftShortcuts.shared.applyMenus() }
+        }
         localHistoryObserver = NotificationCenter.default.addObserver(forName:.init("SiftClearHistory"),object:nil,queue:.main) { [weak self] _ in self?.searchWindow.clearRecentSearches() }
         let args = ProcessInfo.processInfo.arguments
         if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
@@ -125,7 +130,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let combo = AppSettings.hotkey {
                 if !self.hotkey.register(combo) {
                     AppSettings.hotkey = previousShortcut
-                    self.searchWindow.reportConfigurationError("导入的快捷键被占用，原绑定保留。")
+                    self.searchWindow.reportConfigurationError(String(localized: "The imported shortcut is in use. The previous shortcut was kept.", table: "Settings"))
                 }
             } else { self.hotkey.unregister() }
             self.searchWindow.reloadConfiguration()
@@ -138,7 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let previous = self.engine.settingsJSON()
                 if let error = self.engine.updateSettings(data) {
                     if let previous { try? previous.write(to: file, options: .atomic) }
-                    self.searchWindow.reportConfigurationError("配置未应用，保留原索引范围：" + error)
+                    self.searchWindow.reportConfigurationError(String(localized: "Settings could not be applied. The previous search scope was kept: \(SiftText.title(error))", table: "Settings"))
                 }
             }
             if let data = try? Data(contentsOf: store.supportDirectory.appendingPathComponent("runtime.json")),
@@ -168,7 +173,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self else { return false };let d = self.engine.details()
             return Lifecycle.installable(d)
         }
+        // A first launch checks the HTTPS feed once a day (the shared default is off); a choice made in Settings or
+        // with `sift update options` is never changed. Only a build with AppUpdateFeedURL is affected.
+        AppUpdateFeed.seedDailyCheck(bundleID: Bundle.main.bundleIdentifier ?? Lifecycle.productID, bundle: Lifecycle.hostBundle)
         AppLifecycleUI.install(name: Lifecycle.name, configuration: config, updateSource: Lifecycle.updateSource)
+        // Standard settings entry: ⌘, 设置… opens Sift's own Settings window (language row first); the shared window
+        // stays in the app menu as 配置与更新….
+        AppLifecycleUI.useSettings { [weak self] in self?.showSettings(nil) }
+        // Closing the windows keeps Sift in the menu bar (shared MenuBarResident, installed by updateMenuBar once the
+        // icon is shown). No drop-down shortcut: it is an action menu, and those get none (本人 2026-10-20).
         // `sift config sync` and `sift config import` run in another process. The running window follows them (the
         // switch, the status line, the imported settings); the command stays the only writer of the switch.
         AppLifecycleCLI.follow(config)
@@ -292,6 +305,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let item = statusItem { NSStatusBar.system.removeStatusItem(item) };statusItem = nil;return
         }
         if statusItem == nil { statusItem = NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength);statusItem?.button?.image = NSImage(systemSymbolName:"magnifyingglass",accessibilityDescription:"Sift") }
+        #if !APP_STORE
+        // 常驻菜单栏: only with the icon shown, whose drop-down holds the real Quit (⌘Q then just closes the windows).
+        MenuBarResident.install()
+        #endif
         let menu = statusItem?.menu ?? NSMenu()
         menu.delegate = self;refreshStatusMenu(menu);statusItem?.menu = menu
     }
@@ -302,13 +319,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
         let details = engine.details()
         let state = item(SiftDiagnostics.summary(details),nil);state.isEnabled = false;menu.addItem(state)
-        menu.addItem(item("打开 Sift",#selector(showSearch(_:)),target:self))
-        menu.addItem(item(details["paused"] as? Bool == true ? "恢复索引" : "暂停索引",#selector(toggleIndex(_:)),target:self))
-        menu.addItem(item("设置…",#selector(showSettings(_:)),target:self))
-        #if !APP_STORE
-        AppLifecycleUI.menuItems().forEach{menu.addItem($0)}
+        menu.addItem(item(String(localized: "Open Sift", table: "Settings"),#selector(showSearch(_:)),target:self))
+        menu.addItem(item(details["paused"] as? Bool == true ? String(localized: "Resume Indexing", table: "Settings") : String(localized: "Pause Indexing", table: "Settings"),#selector(toggleIndex(_:)),target:self))
+        #if APP_STORE
+        menu.addItem(item(String(localized: "Settings…", table: "Settings"),#selector(showSettings(_:)),target:self))
+        #else
+        menu.addItem(AppLifecycleUI.settingsMenuItem()) // the same 设置… as ⌘, in the app menu
         #endif
-        menu.addItem(.separator());menu.addItem(item("退出 Sift",#selector(NSApplication.terminate(_:)),"q"))
+        menu.addItem(.separator());menu.addItem(item(String(localized: "Quit Sift", table: "Settings"),#selector(NSApplication.terminate(_:)),"q"))
     }
     private func performShortcut(_ id:String) {
         if id == "show" { searchWindow.toggle();return }
@@ -336,77 +354,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let sw = searchWindow!
 
         let app = NSMenu(title: "Sift")
-        app.addItem(item("About Sift", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), ""))
+        app.addItem(item(String(localized: "About Sift", table: "Settings"), #selector(NSApplication.orderFrontStandardAboutPanel(_:)), ""))
+        #if APP_STORE
+        // The Store build has no shared lifecycle layer: its own 设置… (⌘,) stays here.
         app.addItem(.separator())
-        app.addItem(item("Settings…", #selector(showSettings(_:)), ",", target: self))
-        #if !APP_STORE
-        for item in AppLifecycleUI.menuItems() { app.addItem(item) }
+        app.addItem(item(String(localized: "Settings…", table: "Settings"), #selector(showSettings(_:)), ",", target: self))
+        app.addItem(.separator())
         #endif
+        // Otherwise the shared standard settings entry (AppLifecycleUI.useSettings) puts 设置… (⌘, → this app's
+        // Settings window), 配置与更新…, 检查更新… and a separator right after About, and keeps them there.
+        app.addItem(item(String(localized: "Hide Sift", table: "Settings"), #selector(NSApplication.hide(_:)), "h"))
+        app.addItem(item(String(localized: "Hide Others", table: "Settings"), #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]))
+        app.addItem(item(String(localized: "Show All", table: "Settings"), #selector(NSApplication.unhideAllApplications(_:))))
         app.addItem(.separator())
-        app.addItem(item("Hide Sift", #selector(NSApplication.hide(_:)), "h"))
-        app.addItem(item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]))
-        app.addItem(item("Show All", #selector(NSApplication.unhideAllApplications(_:))))
-        app.addItem(.separator())
-        app.addItem(item("Quit Sift", #selector(NSApplication.terminate(_:)), "q"))
+        app.addItem(item(String(localized: "Quit Sift", table: "Settings"), #selector(NSApplication.terminate(_:)), "q"))
 
-        let file = NSMenu(title: "File")
-        file.addItem(item("Open", #selector(SearchWindowController.openSelection(_:)), "o", target: sw))
-        file.addItem(item("Show in Finder", #selector(SearchWindowController.revealSelection(_:)), "r", target: sw))
-        file.addItem(item("用其他应用打开…",#selector(SearchWindowController.openWithSelection(_:)),target:sw))
-        file.addItem(item("文件信息",#selector(SearchWindowController.showFileInfo(_:)),target:sw))
-        file.addItem(item("重命名…",#selector(SearchWindowController.renameSelection(_:)),target:sw))
+        let file = NSMenu(title: String(localized: "File", table: "Settings"))
+        file.addItem(item(String(localized: "Open", table: "Settings"), #selector(SearchWindowController.openSelection(_:)), "o", target: sw))
+        file.addItem(item(String(localized: "Show in Finder", table: "Settings"), #selector(SearchWindowController.revealSelection(_:)), "r", target: sw))
+        file.addItem(item(String(localized: "Open With…", table: "Settings"),#selector(SearchWindowController.openWithSelection(_:)),target:sw))
+        file.addItem(item(String(localized: "Get Info", table: "Settings"),#selector(SearchWindowController.showFileInfo(_:)),target:sw))
+        file.addItem(item(String(localized: "Rename…", table: "Settings"),#selector(SearchWindowController.renameSelection(_:)),target:sw))
         // Space previews (list only); no menu key, so Space in the search field stays a space.
-        file.addItem(item("Quick Look", #selector(SearchWindowController.toggleQuickLook(_:)), "", [], target: sw))
+        file.addItem(item(String(localized: "Quick Look", table: "Settings"), #selector(SearchWindowController.toggleQuickLook(_:)), "", [], target: sw))
         file.addItem(.separator())
-        file.addItem(item("Move to Trash", #selector(SearchWindowController.moveToTrash(_:)),
+        file.addItem(item(String(localized: "Move to Trash", table: "Settings"), #selector(SearchWindowController.moveToTrash(_:)),
                           String(UnicodeScalar(NSBackspaceCharacter)!), target: sw))
         file.addItem(.separator())
-        file.addItem(item("Close Window", #selector(NSWindow.performClose(_:)), "w"))
+        file.addItem(item(String(localized: "Close Window", table: "Settings"), #selector(NSWindow.performClose(_:)), "w"))
 
-        let edit = NSMenu(title: "Edit")
-        edit.addItem(item("Undo", Selector(("undo:")), "z"))
-        edit.addItem(item("Redo", Selector(("redo:")), "Z"))
+        let edit = NSMenu(title: String(localized: "Edit", table: "Settings"))
+        edit.addItem(item(String(localized: "Undo", table: "Settings"), Selector(("undo:")), "z"))
+        edit.addItem(item(String(localized: "Redo", table: "Settings"), Selector(("redo:")), "Z"))
         edit.addItem(.separator())
-        edit.addItem(item("Cut", #selector(NSText.cut(_:)), "x"))
-        edit.addItem(item("Copy", #selector(NSText.copy(_:)), "c"))
-        edit.addItem(item("Paste", #selector(NSText.paste(_:)), "v"))
-        edit.addItem(item("Select All", #selector(NSText.selectAll(_:)), "a"))
+        edit.addItem(item(String(localized: "Cut", table: "Settings"), #selector(NSText.cut(_:)), "x"))
+        edit.addItem(item(String(localized: "Copy", table: "Settings"), #selector(NSText.copy(_:)), "c"))
+        edit.addItem(item(String(localized: "Paste", table: "Settings"), #selector(NSText.paste(_:)), "v"))
+        edit.addItem(item(String(localized: "Select All", table: "Settings"), #selector(NSText.selectAll(_:)), "a"))
         edit.addItem(.separator())
-        edit.addItem(item("Copy Path", #selector(SearchWindowController.copyPaths(_:)), "C", target: sw))
+        edit.addItem(item(String(localized: "Copy Path", table: "Settings"), #selector(SearchWindowController.copyPaths(_:)), "C", target: sw))
         // ⌃⇧⌘N = "copy file names" in Finder (Hammerspoon, right ⌥ + N): same key here.
-        edit.addItem(item("Copy Name", #selector(SearchWindowController.copyNames(_:)), "n", [.command, .control, .shift], target: sw))
+        edit.addItem(item(String(localized: "Copy Name", table: "Settings"), #selector(SearchWindowController.copyNames(_:)), "n", [.command, .control, .shift], target: sw))
 
-        let search = NSMenu(title: "Search")
-        search.addItem(item("Find", #selector(SearchWindowController.focusSearch(_:)), "f", target: sw))
-        search.addItem(item("Focus Search Field", #selector(SearchWindowController.focusSearch(_:)), "l", target: sw))
+        let search = NSMenu(title: String(localized: "Search", table: "Settings"))
+        search.addItem(item(String(localized: "Find", table: "Settings"), #selector(SearchWindowController.focusSearch(_:)), "f", target: sw))
+        search.addItem(item(String(localized: "Focus Search Field", table: "Settings"), #selector(SearchWindowController.focusSearch(_:)), "l", target: sw))
         // ⌘Y opens history, as in Safari and Chrome.
-        search.addItem(item("Recent Searches", #selector(SearchWindowController.showHistory(_:)), "y", target: sw))
-        search.addItem(item("常用搜索",#selector(SearchWindowController.showSavedSearches(_:)),target:sw))
-        search.addItem(item("保存当前搜索…",#selector(SearchWindowController.saveCurrentSearch(_:)),target:sw))
-        search.addItem(item("导出搜索结果…",#selector(SearchWindowController.exportResults(_:)),target:sw))
+        search.addItem(item(String(localized: "Recent Searches", table: "Settings"), #selector(SearchWindowController.showHistory(_:)), "y", target: sw))
+        search.addItem(item(String(localized: "Saved Searches", table: "Settings"),#selector(SearchWindowController.showSavedSearches(_:)),target:sw))
+        search.addItem(item(String(localized: "Save Current Search…", table: "Settings"),#selector(SearchWindowController.saveCurrentSearch(_:)),target:sw))
+        search.addItem(item(String(localized: "Export Search Results…", table: "Settings"),#selector(SearchWindowController.exportResults(_:)),target:sw))
         search.addItem(.separator())
-        search.addItem(item("Match Case", #selector(SearchWindowController.toggleCase(_:)), "i", target: sw))
+        search.addItem(item(String(localized: "Match Case", table: "Settings"), #selector(SearchWindowController.toggleCase(_:)), "i", target: sw))
         search.addItem(.separator())
-        let sorts: [(String, SortKey)] = [("Sort by Name", .name), ("Sort by Folder", .path),
-                                          ("Sort by Size", .size), ("Sort by Date Modified", .modified),
-                                          ("Sort by Date Created", .created)]
+        let sorts: [(String, SortKey)] = [(String(localized: "Sort by Name", table: "Settings"), .name), (String(localized: "Sort by Folder", table: "Settings"), .path),
+                                          (String(localized: "Sort by Size", table: "Settings"), .size), (String(localized: "Sort by Date Modified", table: "Settings"), .modified),
+                                          (String(localized: "Sort by Date Created", table: "Settings"), .created)]
         for (i, (title, key)) in sorts.enumerated() {
             search.addItem(item(title, #selector(SearchWindowController.sortMenu(_:)), String(i + 1),
                                 target: sw, tag: Int(key.rawValue)))
         }
         search.addItem(.separator())
-        search.addItem(item("Re-index Everything", #selector(SearchWindowController.rescan(_:)), "R", target: sw))
+        search.addItem(item(String(localized: "Rebuild Index", table: "Settings"), #selector(SearchWindowController.rescan(_:)), "R", target: sw))
         #if APP_STORE
-        search.addItem(item("Choose Folder to Index…", #selector(SearchWindowController.chooseIndexFolder(_:)), "", target: sw))
+        search.addItem(item(String(localized: "Choose Folder to Index…", table: "Settings"), #selector(SearchWindowController.chooseIndexFolder(_:)), "", target: sw))
         #endif
 
-        let window = NSMenu(title: "Window")
-        window.addItem(item("Search Window", #selector(showSearch(_:)), "0", target: self))
-        window.addItem(item("Minimize", #selector(NSWindow.performMiniaturize(_:)), "m"))
-        window.addItem(item("缩放",#selector(NSWindow.performZoom(_:))))
+        let window = NSMenu(title: String(localized: "Window", table: "Settings"))
+        window.addItem(item(String(localized: "Search Window", table: "Settings"), #selector(showSearch(_:)), "0", target: self))
+        window.addItem(item(String(localized: "Minimize", table: "Settings"), #selector(NSWindow.performMiniaturize(_:)), "m"))
+        window.addItem(item(String(localized: "Zoom", table: "Settings"),#selector(NSWindow.performZoom(_:))))
         NSApp.windowsMenu = window
-        let help = NSMenu(title:"帮助")
-        help.addItem(item("使用指南与快捷键",#selector(showHelp(_:)),target:self))
+        let help = NSMenu(title:String(localized: "Help", table: "Settings"))
+        help.addItem(item(String(localized: "User Guide and Shortcuts", table: "Settings"),#selector(showHelp(_:)),target:self))
         NSApp.helpMenu = help
         for menu in [app, file, edit, search, window, help] {
             let holder = NSMenuItem()

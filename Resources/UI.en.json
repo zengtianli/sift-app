@@ -1,0 +1,16 @@
+{
+  "copy": {
+    "search.placeholder": "Search file names or paths",
+    "search.folder": "In folders matching…",
+    "menu.settings": "Settings…",
+    "menu.history": "Recent Searches",
+    "menu.reindex": "Rebuild Index",
+    "store.save.note": "Saves changes when needed. Sift still saves on quit when this is off.",
+    "store.permissions.note": "Grant access using the system folder picker. macOS manages login items; they do not sync with your settings.",
+    "store.help.missing": "Check folder access, exclusions, paused indexing, and incomplete index warnings. Choose a folder again, export diagnostics, or rebuild the index. Protected macOS locations remain restricted.",
+    "store.help.compatibility": "Apple Silicon, macOS 14 or later. This edition updates through the App Store. Optional iCloud settings sync and import/export are below. The index and folder access permissions stay on this Mac.",
+    "store.help.privacy": "Your index and recent searches stay on this Mac and are not uploaded to the developer. If you enable iCloud, Apple syncs settings such as shortcuts, saved searches, and inclusion/exclusion rules. Saved queries and rules may contain names or paths you enter. The index and recent searches do not sync. This edition updates through the App Store. Diagnostics omit scope paths and search history by default.",
+    "store.access.explanation": "Choose folders to index. Protected macOS locations remain restricted.",
+    "store.access.panel": "Choose a folder Sift may index, such as a project folder or {disk}. Protected macOS locations remain restricted."
+  }
+}

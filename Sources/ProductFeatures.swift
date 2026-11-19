@@ -9,6 +9,8 @@ struct ShortcutAction {
     let modifiers: NSEvent.ModifierFlags
     var tag: Int = 0
     var fileAction = false
+    // The raw title is part of the CLI contract. Localize only where the GUI displays it.
+    var localizedTitle: String { SiftText.title(title) }
     static let all: [ShortcutAction] = [
         .init(id: "show", title: "显示/隐藏搜索窗", selector: "showSearch:", key: nil, modifiers: []),
         .init(id: "settings", title: "打开设置", selector: "showSettings:", key: 43, modifiers: .command),
@@ -122,7 +124,9 @@ final class SiftShortcuts {
     func applyMenus() {
         for action in ShortcutAction.all where action.id != "show" {
             let items = NSApp.mainMenu?.items.flatMap { $0.submenu?.items ?? [] } ?? []
-            guard let item = items.first(where: { $0.action.map(NSStringFromSelector) == action.selector && (action.selector != "sortMenu:" || $0.tag == action.tag) }) else { continue }
+            // 打开设置 is the shared standard 设置… item (AppLifecycleUI.useSettings), whose action is the shared layer's own.
+            let selectors = action.id == "settings" ? [action.selector, "openSettingsPage"] : [action.selector]
+            guard let item = items.first(where: { $0.action.map(NSStringFromSelector).map(selectors.contains) == true && (action.selector != "sortMenu:" || $0.tag == action.tag) }) else { continue }
             if scope(action.id) == "app", let key = combo(action) {
                 item.keyEquivalent = key.menuKey
                 item.keyEquivalentModifierMask = key.modifiers

@@ -1,6 +1,8 @@
 // Shared macOS settings migration and version UI. Edit the shared source, then vendor.
 #if os(macOS)
 import AppKit
+import SwiftUI
+import Carbon.HIToolbox
 import CryptoKit
 
 final class AppLifecycleUI: NSObject {
@@ -18,11 +20,13 @@ final class AppLifecycleUI: NSObject {
     private var status = AppLifecycleUI.detailLabel()
     private var syncStatus = AppLifecycleUI.detailLabel()
     private var cloudToggle = NSSwitch()
-    private var updateButton = NSButton(title: "检查更新", target: nil, action: nil)
-    private var installButton = NSButton(title: "升级到新版…", target: nil, action: nil)
+    private var updateButton = NSButton(title: LifecycleText.pick("Check for Updates", "检查更新"), target: nil, action: nil)
+    private var installButton = NSButton(title: LifecycleText.pick("Update to New Version…", "升级到新版…"), target: nil, action: nil)
     private var spinner = NSProgressIndicator()
     private var release: AppRelease?
     private var observers: [NSObjectProtocol] = []
+    private var menuObservers: [NSObjectProtocol] = []
+    private var mainMenuWatch: NSKeyValueObservation?
     private var working = false
     var canInstallUpdate: (() -> Bool)?
     private var automaticTimer: Timer?
@@ -38,10 +42,11 @@ final class AppLifecycleUI: NSObject {
     private let intervalPopup = NSPopUpButton()
     private let channelPopup = NSPopUpButton()
     private let updateDetails = AppLifecycleUI.detailLabel()
-    private let cancelButton = NSButton(title:"取消下载/验证",target:nil,action:nil)
-    private let notesButton = NSButton(title:"更新内容…",target:nil,action:nil)
-    private let skipButton = NSButton(title:"跳过此版",target:nil,action:nil)
-    private let remindButton = NSButton(title:"明天提醒",target:nil,action:nil)
+    private let language = LifecycleLanguageRow()
+    private let cancelButton = NSButton(title:LifecycleText.pick("Cancel Download/Verification", "取消下载/验证"),target:nil,action:nil)
+    private let notesButton = NSButton(title:LifecycleText.pick("What's New…", "更新内容…"),target:nil,action:nil)
+    private let skipButton = NSButton(title:LifecycleText.pick("Skip Version", "跳过此版"),target:nil,action:nil)
+    private let remindButton = NSButton(title:LifecycleText.pick("Remind Tomorrow", "明天提醒"),target:nil,action:nil)
     private var bundleID:String { Bundle.main.bundleIdentifier ?? "" }
     private var currentVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0" }
     private var currentBuild: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "0" }
@@ -55,37 +60,133 @@ final class AppLifecycleUI: NSObject {
         if startConfiguration { configuration?.start() }
         if instance.observers.isEmpty {
             instance.observers.append(NotificationCenter.default.addObserver(forName: NSApplication.didFinishLaunchingNotification, object: nil, queue: .main) { _ in
-                DispatchQueue.main.async { shared.attachMenu() }
+                DispatchQueue.main.async { AppLifecycleUI.shared.attachMenu() }
             })
             instance.observers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in shared.attachMenu() })
             instance.observers.append(NotificationCenter.default.addObserver(forName: NSNotification.Name("AppConfigurationStatusChanged"), object: configuration, queue: .main) { _ in shared.refreshConfiguration() })
         }
         instance.attachMenu()
+        instance.keepMenuAttached()
         instance.scheduleAutomaticChecks()
         if instance.observers.count < 4 {
             instance.observers.append(DistributedNotificationCenter.default().addObserver(forName:Notification.Name("cyou.tianli.update-options." + instance.bundleID),object:nil,queue:.main) { _ in shared.refreshUpdateOptions();shared.scheduleAutomaticChecks() })
         }
     }
 
-    static func menuItems() -> [NSMenuItem] {
-        let settings = NSMenuItem(title: "配置与更新…", action: #selector(openSettings), keyEquivalent: "")
+    // MARK: Standard settings entry — one module for every Mac app (本人 2026-11-08「cmd , 得是 设置」「搞成一个模块，可以复用」)
+    //
+    // ⌘, always opens 设置… / Settings…, placed in the app menu by this shared layer and re-attached whenever SwiftUI
+    // rebuilds the menu. A product never hand-writes that item:
+    //   · no settings page of its own → nothing to call; ⌘, opens this shared window (language row first).
+    //   · its own settings page → `AppLifecycleUI.useSettings { open it }` once at launch; ⌘, opens that page, and this
+    //     window stays reachable as 配置与更新… (no shortcut). That page puts the language row first
+    //     (`LifecycleLanguageRow.group()` in AppKit, `LifecycleLanguagePicker()` in SwiftUI).
+    //   · a menu bar panel or status menu → `AppLifecycleUI.statusMenuItems()` (设置… ⌘,, 检查更新…; 配置与更新… too when
+    //     the product has its own page), or just `settingsMenuItem()` for a single 设置… button.
+    //   · never add `menuItems()` to the app menu by hand: the shared layer then sees its items and does not bind ⌘,.
+    // Checked on the real running app by menu_settings_check.py (Chapter settings-menu).
+
+    /// The product's own settings page, when it has one (`useSettings`). nil: ⌘, opens this shared window.
+    private var productSettings: (() -> Void)?
+    private static let menuID = NSUserInterfaceItemIdentifier("appLifecycle.menu")
+
+    /// Call once at launch when the product has its own settings page: ⌘, 设置… then opens it.
+    static func useSettings(_ open: @escaping () -> Void) {
+        shared.productSettings = open
+        shared.detachMenu()
+        shared.attachMenu()
+    }
+
+    /// 设置… (⌘,) for a menu bar panel or any extra menu: opens the same page as ⌘, in the app menu.
+    static func settingsMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: LifecycleText.pick("Settings…", "设置…"), action: #selector(AppLifecycleUI.openSettingsPage), keyEquivalent: ",")
+        item.keyEquivalentModifierMask = .command
+        item.target = shared
+        return item
+    }
+
+    /// The standard block for a menu bar panel / status menu: 设置… (⌘,), then 配置与更新… only when the product has its
+    /// own settings page, then 检查更新…. Products add these and nothing hand-written.
+    static func statusMenuItems() -> [NSMenuItem] {
+        let update = NSMenuItem(title: LifecycleText.pick("Check for Updates…", "检查更新…"), action: #selector(checkUpdates), keyEquivalent: "")
+        update.target = shared
+        guard shared.productSettings != nil else { return [settingsMenuItem(), update] }
+        return [settingsMenuItem(), menuItems(ownsSettings: false)[0], update]
+    }
+
+    /// Opens what ⌘, opens: the product's own settings page, or this shared window.
+    static func openStandardSettings() { shared.openSettingsPage() }
+    @objc private func openSettingsPage() {
+        guard let productSettings else { show(); return }
+        if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+        productSettings()
+    }
+
+    /// The shared window's own two items, for products that still build their menu by hand. `ownsSettings: true` names
+    /// the window 设置… (it is the settings page); false keeps 配置与更新… beside a product's own 设置….
+    static func menuItems(ownsSettings: Bool = false) -> [NSMenuItem] {
+        let title = ownsSettings ? LifecycleText.pick("Settings…", "设置…") : LifecycleText.pick("Settings & Updates…", "配置与更新…")
+        let settings = NSMenuItem(title: title, action: #selector(openSettings), keyEquivalent: "")
         settings.target = shared
-        let update = NSMenuItem(title: "检查更新…", action: #selector(checkUpdates), keyEquivalent: "")
+        let update = NSMenuItem(title: LifecycleText.pick("Check for Updates…", "检查更新…"), action: #selector(checkUpdates), keyEquivalent: "")
         update.target = shared
         return [settings, update]
     }
 
     private func attachMenu() {
+        // Ours already there, or a product that still adds `menuItems()` by hand (legacy): leave the menu alone.
         guard let appMenu = NSApp.mainMenu?.items.first?.submenu,
-              !appMenu.items.contains(where: { ($0.target === self && $0.action == #selector(openSettings)) || $0.title == "配置与更新…" }) else { return }
-        let items = Self.menuItems()
+              !appMenu.items.contains(where: { $0.identifier == Self.menuID || ($0.target === self && $0.action == #selector(openSettings))
+                  || ["配置与更新…", "Settings & Updates…"].contains($0.title) }) else { return }
+        // A ⌘, the product still binds by hand keeps it (Chapter settings-menu reports that product as not migrated).
+        let taken = NSApp.mainMenu?.items.compactMap(\.submenu).flatMap(\.items).contains { $0.keyEquivalent == "," && $0.keyEquivalentModifierMask.intersection([.command, .shift, .option, .control]) == .command } ?? false
+        var items: [NSMenuItem]
+        if productSettings != nil {
+            let settings = Self.settingsMenuItem()
+            if taken { settings.keyEquivalent = "" }
+            items = [settings] + Self.menuItems(ownsSettings: false)
+        } else {
+            items = Self.menuItems(ownsSettings: !taken)
+            if !taken { items[0].keyEquivalent = ","; items[0].keyEquivalentModifierMask = .command }
+        }
+        // After About; one separator on each side, never two in a row next to the product's own separators.
         let index = min(1, appMenu.numberOfItems)
-        for (offset, item) in items.enumerated() { appMenu.insertItem(item, at: index + offset) }
-        appMenu.insertItem(.separator(), at: index + items.count)
+        var block = items
+        if index < appMenu.numberOfItems, !appMenu.items[index].isSeparatorItem { block.append(.separator()) }
+        if index > 0, !appMenu.items[index - 1].isSeparatorItem { block.insert(.separator(), at: 0) }
+        for (offset, item) in block.enumerated() { item.identifier = Self.menuID; appMenu.insertItem(item, at: index + offset) }
+    }
+
+    private func detachMenu() {
+        guard let appMenu = NSApp.mainMenu?.items.first?.submenu else { return }
+        appMenu.items.filter { $0.identifier == Self.menuID }.forEach(appMenu.removeItem)
+    }
+
+    /// SwiftUI rebuilds the main menu after launch and on scene updates, dropping the hand-added 设置… (⌘,) item with
+    /// no later launch/activate event (unrevoke 1.0.15 2026-11-08: the app menu had only About/Services/Hide/Quit, so ⌘,
+    /// did nothing). Re-check after every event and when the main menu is replaced; attachMenu is a no-op while attached.
+    private func keepMenuAttached() {
+        guard menuObservers.isEmpty else { return }
+        menuObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didUpdateNotification, object: nil, queue: .main) { _ in
+            AppLifecycleUI.shared.attachMenu()
+        })
+        // SwiftUI edits the main menu in place (often while the app sits in the background), so watch the main menu
+        // and the app menu themselves; attachMenu's own insertions come back here once and stop at its guard.
+        for name in [NSMenu.didAddItemNotification, NSMenu.didRemoveItemNotification, NSMenu.didChangeItemNotification] {
+            menuObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { note in
+                guard let menu = note.object as? NSMenu, let root = NSApp.mainMenu,
+                      menu === root || menu === root.items.first?.submenu else { return }
+                DispatchQueue.main.async { AppLifecycleUI.shared.attachMenu() }
+            })
+        }
+        mainMenuWatch = NSApp.observe(\.mainMenu, options: [.new]) { _, _ in
+            DispatchQueue.main.async { AppLifecycleUI.shared.attachMenu() }
+        }
     }
 
     @objc private func openSettings() { show() }
-    @objc private func checkUpdates() { checkForUpdates() }
+    // An offscreen self-test (activation policy .prohibited) checks without showing the window.
+    @objc private func checkUpdates() { checkForUpdates(present: NSApp.activationPolicy() != .prohibited) }
 
     func show() {
         makeWindow()
@@ -176,7 +277,7 @@ final class AppLifecycleUI: NSObject {
         installButton.isHidden = true
         updateButton.isEnabled = false
         spinner.startAnimation(nil)
-        status.stringValue = "正在检查发行版本…"
+        status.stringValue = LifecycleText.pick("Checking for releases…", "正在检查发行版本…")
         let requestedSource = AppUpdatePreferences.describe(AppUpdatePreferences.source(source,bundleID))
         AppUpdateChecker.check(source: source, bundleID: bundleID, version: currentVersion, build: currentBuild) { [weak self] result in
             DispatchQueue.main.async { [weak self] in
@@ -185,20 +286,20 @@ final class AppLifecycleUI: NSObject {
                 self.updateButton.isEnabled = true
                 self.spinner.stopAnimation(nil)
                 self.refreshUpdateOptions()
-                guard requestedSource == AppUpdatePreferences.describe(AppUpdatePreferences.source(self.source,self.bundleID)) else { self.status.stringValue = "渠道已改变，请检查所选渠道。";return }
+                guard requestedSource == AppUpdatePreferences.describe(AppUpdatePreferences.source(self.source,self.bundleID)) else { self.status.stringValue = LifecycleText.pick("The channel changed; check the selected channel.", "渠道已改变，请检查所选渠道。");return }
                 switch result {
-                case .failure(let error): self.status.stringValue = "检查未完成：" + error.localizedDescription
+                case .failure(let error): self.status.stringValue = LifecycleText.pick("Check did not finish: ", "检查未完成：") + LifecycleText.display(error.localizedDescription)
                 case .success(let release):
                     self.release = release
                     self.notesButton.isEnabled = true
                     self.skipButton.isEnabled = release.isNewer(than:self.currentVersion,build:self.currentBuild)
                     if release.isNewer(than: self.currentVersion, build: self.currentBuild) {
-                        self.status.stringValue = "有新版 \(release.version) (\(release.build))，当前 \(self.currentVersion) (\(self.currentBuild))。升级会保留本机配置。"
+                        self.status.stringValue = LifecycleText.pick("Version \(release.version) (\(release.build)) is available; you have \(self.currentVersion) (\(self.currentBuild)). Updating keeps this Mac's settings.", "有新版 \(release.version) (\(release.build))，当前 \(self.currentVersion) (\(self.currentBuild))。升级会保留本机配置。")
                         self.installButton.isHidden = release.downloadURL == nil
-                        self.installButton.title = AppUpgradeInstaller.supportsReplacement(release: release, currentBundle: Bundle.main.bundleURL) ? "升级到新版…" : "下载新版…"
+                        self.installButton.title = AppUpgradeInstaller.supportsReplacement(release: release, currentBundle: Bundle.main.bundleURL) ? LifecycleText.pick("Update to New Version…", "升级到新版…") : LifecycleText.pick("Download New Version…", "下载新版…")
                     } else if AppVersion.compare(self.currentVersion, release.version) == .orderedDescending || (AppVersion.compare(self.currentVersion,release.version) == .orderedSame && AppVersion.compare(self.currentBuild,release.build) == .orderedDescending) {
-                        self.status.stringValue = "当前 \(self.currentVersion) (\(self.currentBuild))；此渠道正式发行版本为 \(release.version) (\(release.build))。"
-                    } else { self.status.stringValue = "当前已是此渠道最新版：\(self.currentVersion) (\(self.currentBuild))。" }
+                        self.status.stringValue = LifecycleText.pick("You have \(self.currentVersion) (\(self.currentBuild)); this channel's release is \(release.version) (\(release.build)).", "当前 \(self.currentVersion) (\(self.currentBuild))；此渠道正式发行版本为 \(release.version) (\(release.build))。")
+                    } else { self.status.stringValue = LifecycleText.pick("You have the latest version on this channel: \(self.currentVersion) (\(self.currentBuild)).", "当前已是此渠道最新版：\(self.currentVersion) (\(self.currentBuild))。") }
                     if !present,release.isNewer(than:self.currentVersion,build:self.currentBuild) {
                         let options = AppUpdatePreferences.options(self.bundleID)
                         if options.skippedBuild != self.releaseKey(release) {
@@ -242,18 +343,18 @@ final class AppLifecycleUI: NSObject {
         if transferAutomatic && (!options.automaticCheck || !options.automaticDownload) { transfer?.cancel() }
         checkToggle.state = options.automaticCheck ? .on : .off;downloadToggle.state = options.automaticDownload ? .on : .off;installToggle.state = options.automaticInstall ? .on : .off
         downloadToggle.isEnabled = options.automaticCheck && !options.automaticInstall;installToggle.isEnabled = options.automaticCheck
-        intervalPopup.removeAllItems();for hours in Set([1,6,24,168,720,options.intervalHours]).sorted() { intervalPopup.addItem(withTitle:"\(hours) 小时");intervalPopup.lastItem?.representedObject = hours };intervalPopup.selectItem(at:intervalPopup.itemArray.firstIndex(where:{$0.representedObject as? Int == options.intervalHours}) ?? 0)
+        intervalPopup.removeAllItems();for hours in Set([1,6,24,168,720,options.intervalHours]).sorted() { intervalPopup.addItem(withTitle:LifecycleText.pick(hours == 1 ? "1 hour" : "\(hours) hours", "\(hours) 小时"));intervalPopup.lastItem?.representedObject = hours };intervalPopup.selectItem(at:intervalPopup.itemArray.firstIndex(where:{$0.representedObject as? Int == options.intervalHours}) ?? 0)
         channelPopup.removeAllItems()
         if case .privateCloud(let base) = source {
             var channels:Set<String> = [base,options.channel ?? base]
             if let directory = try? AppUpdateChecker.privateDirectory(bundleID:bundleID,channel:base).deletingLastPathComponent(),
                let entries = try? FileManager.default.contentsOfDirectory(at:directory,includingPropertiesForKeys:nil) { entries.filter{AppUpdatePreferences.validChannel($0.lastPathComponent)}.forEach{channels.insert($0.lastPathComponent)} }
             channelPopup.addItems(withTitles:channels.sorted());channelPopup.selectItem(withTitle:options.channel ?? base);channelPopup.isEnabled = true
-        } else { channelPopup.addItem(withTitle:"由发行源决定");channelPopup.isEnabled = false }
+        } else { channelPopup.addItem(withTitle:LifecycleText.pick("Set by release source", "由发行源决定"));channelPopup.isEnabled = false }
         let state = AppUpdatePreferences.defaults(bundleID).dictionary(forKey:"appUpdateState") ?? [:]
-        let time = (state["last_success_at"] as? Double).map{DateFormatter.localizedString(from:Date(timeIntervalSince1970:$0),dateStyle:.short,timeStyle:.short)} ?? "尚未成功检查"
-        updateDetails.stringValue = AppUpdatePreferences.describe(AppUpdatePreferences.source(source,bundleID)) + " · 上次成功：" + time + ((state["last_error"] as? String).flatMap{$0.isEmpty ? nil : " · " + $0} ?? "")
-        if let release { skipButton.title = options.skippedBuild == releaseKey(release) ? "不再跳过" : "跳过此版" }
+        let time = (state["last_success_at"] as? Double).map{DateFormatter.localizedString(from:Date(timeIntervalSince1970:$0),dateStyle:.short,timeStyle:.short)} ?? LifecycleText.pick("No successful check yet", "尚未成功检查")
+        updateDetails.stringValue = LifecycleText.display(AppUpdatePreferences.describe(AppUpdatePreferences.source(source,bundleID))) + LifecycleText.pick(" · Last success: ", " · 上次成功：") + time + ((state["last_error"] as? String).flatMap{$0.isEmpty ? nil : " · " + LifecycleText.display($0)} ?? "")
+        if let release { skipButton.title = options.skippedBuild == releaseKey(release) ? LifecycleText.pick("Stop Skipping", "不再跳过") : LifecycleText.pick("Skip Version", "跳过此版") }
     }
     @objc private func changedUpdateOption(_ sender:NSControl) {
         var options = AppUpdatePreferences.options(bundleID)
@@ -265,22 +366,22 @@ final class AppLifecycleUI: NSObject {
         case channelPopup:options.channel = channelPopup.titleOfSelectedItem;release = nil;installButton.isHidden = true
         default:return
         }
-        do { try AppUpdatePreferences.save(options,bundleID);status.stringValue = "更新选项已保存。" } catch { status.stringValue = error.localizedDescription }
+        do { try AppUpdatePreferences.save(options,bundleID);status.stringValue = LifecycleText.pick("Update options saved.", "更新选项已保存。") } catch { status.stringValue = LifecycleText.display(error.localizedDescription) }
         refreshUpdateOptions();scheduleAutomaticChecks()
     }
     @objc private func skipRelease() {
         guard let release else { return };var options = AppUpdatePreferences.options(bundleID)
         options.skippedBuild = options.skippedBuild == releaseKey(release) ? nil : releaseKey(release)
-        do { try AppUpdatePreferences.save(options,bundleID);status.stringValue = options.skippedBuild == nil ? "已恢复此版本提醒。" : "已跳过此版自动提醒，手动升级仍可用。" } catch { status.stringValue = error.localizedDescription };refreshUpdateOptions()
+        do { try AppUpdatePreferences.save(options,bundleID);status.stringValue = options.skippedBuild == nil ? LifecycleText.pick("Reminders for this version are back on.", "已恢复此版本提醒。") : LifecycleText.pick("Automatic reminders skip this version; you can still update manually.", "已跳过此版自动提醒，手动升级仍可用。") } catch { status.stringValue = LifecycleText.display(error.localizedDescription) };refreshUpdateOptions()
     }
-    @objc private func remindLater() { var options = AppUpdatePreferences.options(bundleID);options.remindAfter = Date().timeIntervalSince1970 + 86400;do { try AppUpdatePreferences.save(options,bundleID);status.stringValue = "已延后到明天提醒。" } catch { status.stringValue = error.localizedDescription } }
+    @objc private func remindLater() { var options = AppUpdatePreferences.options(bundleID);options.remindAfter = Date().timeIntervalSince1970 + 86400;do { try AppUpdatePreferences.save(options,bundleID);status.stringValue = LifecycleText.pick("You'll be reminded tomorrow.", "已延后到明天提醒。") } catch { status.stringValue = LifecycleText.display(error.localizedDescription) } }
     @objc private func showReleaseNotes() {
-        guard let release else { return };let alert = NSAlert();alert.messageText = "\(productName) \(release.version) (\(release.build))";alert.informativeText = "发布：\(release.publishedAt ?? "此渠道未提供日期")"
-        let view = NSTextView();view.isEditable = false;view.isRichText = false;view.font = .systemFont(ofSize:12);view.string = release.notes ?? "此渠道没有提供更新内容。"
+        guard let release else { return };let alert = NSAlert();alert.messageText = "\(productName) \(release.version) (\(release.build))";alert.informativeText = LifecycleText.pick("Published: ", "发布：") + (release.publishedAt ?? LifecycleText.pick("No date from this channel", "此渠道未提供日期"))
+        let view = NSTextView();view.isEditable = false;view.isRichText = false;view.font = .systemFont(ofSize:12);view.string = release.notes ?? LifecycleText.pick("This channel provided no release notes.", "此渠道没有提供更新内容。")
         let scroll = NSScrollView(frame:NSRect(x:0,y:0,width:440,height:220));scroll.hasVerticalScroller = true;scroll.documentView = view;view.autoresizingMask = [.width];view.textContainer?.widthTracksTextView = true;alert.accessoryView = scroll
         if let window = controller?.window { alert.beginSheetModal(for:window,completionHandler:nil) }
     }
-    @objc private func cancelUpgrade() { transfer?.cancel();cancelButton.isEnabled = false;status.stringValue = "正在取消，当前 App 保留…" }
+    @objc private func cancelUpgrade() { transfer?.cancel();cancelButton.isEnabled = false;status.stringValue = LifecycleText.pick("Canceling; the current app is kept…", "正在取消，当前 App 保留…") }
     private func prepareRelease(_ release:AppRelease,automatic:Bool) {
         guard !working else { return }
         if preparedKey == cacheKey(release),let prepared {
@@ -289,45 +390,45 @@ final class AppLifecycleUI: NSObject {
         if let prepared { try? FileManager.default.removeItem(at:prepared.directory);self.prepared = nil;preparedKey = nil }
         working = true;transferAutomatic = automatic;updateButton.isEnabled = false;installButton.isEnabled = false;cancelButton.isHidden = false;cancelButton.isEnabled = true;spinner.startAnimation(nil)
         let transfer = AppUpgradeInstaller.Transfer();self.transfer = transfer
-        transfer.progress = { [weak self,weak transfer] stage,done,total in DispatchQueue.main.async { guard let self,let transfer,self.transfer === transfer else { return };self.status.stringValue = total > 0 ? "\(stage) · \(Int(Double(done)/Double(total)*100))% (\(done)/\(total) 字节)" : stage } }
+        transfer.progress = { [weak self,weak transfer] stage,done,total in DispatchQueue.main.async { guard let self,let transfer,self.transfer === transfer else { return };self.status.stringValue = total > 0 ? "\(LifecycleText.display(stage)) · \(Int(Double(done)/Double(total)*100))% (\(done)/\(total) " + LifecycleText.pick("bytes)", "字节)") : LifecycleText.display(stage) } }
         let cache = configuration?.updateDownloadDirectory
         AppUpgradeInstaller.prepare(release:release,currentBundle:Bundle.main.bundleURL,transfer:transfer,cacheRoot:cache) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self,self.transfer === transfer else { return }
                 self.working = false;self.transfer = nil;self.cancelButton.isHidden = true;self.updateButton.isEnabled = true;self.installButton.isEnabled = true;self.spinner.stopAnimation(nil)
                 switch result {
-                case .failure(let error):self.status.stringValue = "升级未完成，当前 App 保留：" + error.localizedDescription
+                case .failure(let error):self.status.stringValue = LifecycleText.pick("Update did not finish; the current app is kept: ", "升级未完成，当前 App 保留：") + LifecycleText.display(error.localizedDescription)
                 case .success(let prepared):
-                    if transfer.canceled { try? FileManager.default.removeItem(at:prepared.directory);self.status.stringValue = "已取消，当前 App 保留。";return }
-                    self.prepared = prepared;self.preparedKey = self.cacheKey(release);self.status.stringValue = "新版已下载并验证；配置和当前 App 保留。"
+                    if transfer.canceled { try? FileManager.default.removeItem(at:prepared.directory);self.status.stringValue = LifecycleText.pick("Canceled; the current app is kept.", "已取消，当前 App 保留。");return }
+                    self.prepared = prepared;self.preparedKey = self.cacheKey(release);self.status.stringValue = LifecycleText.pick("The new version is downloaded and verified; settings and the current app are kept.", "新版已下载并验证；配置和当前 App 保留。")
                     if !automatic || AppUpdatePreferences.options(self.bundleID).automaticInstall && !NSApp.isActive && (self.canInstallUpdate?() ?? true) { self.replacePrepared(prepared) }
                 }
             }
         }
     }
     private func replacePrepared(_ prepared:AppUpgradeInstaller.Prepared) {
-        guard canInstallUpdate?() ?? true else { status.stringValue = "正在处理任务，安装已延后；当前 App 保留。";return }
-        do { working = true;cancelButton.isHidden = true;status.stringValue = "正在替换并重新打开…";try AppUpgradeInstaller.launchReplacement(prepared,currentBundle:Bundle.main.bundleURL,pid:ProcessInfo.processInfo.processIdentifier);NSApp.terminate(nil) }
-        catch { working = false;status.stringValue = "替换未完成，当前 App 保留：" + error.localizedDescription }
+        guard canInstallUpdate?() ?? true else { status.stringValue = LifecycleText.pick("A task is in progress, so installing is postponed; the current app is kept.", "正在处理任务，安装已延后；当前 App 保留。");return }
+        do { working = true;cancelButton.isHidden = true;status.stringValue = LifecycleText.pick("Replacing and reopening…", "正在替换并重新打开…");try AppUpgradeInstaller.launchReplacement(prepared,currentBundle:Bundle.main.bundleURL,pid:ProcessInfo.processInfo.processIdentifier);NSApp.terminate(nil) }
+        catch { working = false;status.stringValue = LifecycleText.pick("Replacement did not finish; the current app is kept: ", "替换未完成，当前 App 保留：") + LifecycleText.display(error.localizedDescription) }
     }
 
     private func makeWindow() {
         guard controller == nil else { return }
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: Self.formWidth + 40, height: 240),
                               styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: true)
-        window.title = "\(productName) 设置"
+        window.title = LifecycleText.pick("\(productName) Settings", "\(productName) 设置")
         window.isReleasedWhenClosed = false
         let icon = NSImageView(image: NSApp.applicationIconImage)
         icon.imageScaling = .scaleProportionallyUpOrDown
         let name = NSTextField(labelWithString: productName)
         name.font = .systemFont(ofSize: 17, weight: .semibold)
-        let version = NSTextField(labelWithString: "版本 \(currentVersion) (\(currentBuild))")
+        let version = NSTextField(labelWithString: LifecycleText.pick("Version ", "版本 ") + "\(currentVersion) (\(currentBuild))")
         version.font = .systemFont(ofSize: 12); version.textColor = .secondaryLabelColor
         let titles = NSStackView(views: [name, version])
         titles.orientation = .vertical; titles.alignment = .leading; titles.spacing = 2
         let header = NSStackView(views: [icon, titles])
         header.spacing = 12; header.alignment = .centerY; header.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 2, right: 0)
-        status.stringValue = "按需检查，或在下方开启自动检查。自动行为默认关闭。"
+        status.stringValue = LifecycleText.pick("Check when you like, or turn on automatic checks below. Automatic actions are off by default.", "按需检查，或在下方开启自动检查。自动行为默认关闭。")
         updateButton.target = self; updateButton.action = #selector(checkUpdates)
         installButton.target = self; installButton.action = #selector(upgrade)
         installButton.isHidden = true; installButton.keyEquivalent = "\r"
@@ -337,26 +438,33 @@ final class AppLifecycleUI: NSObject {
         notesButton.target = self;notesButton.action = #selector(showReleaseNotes);notesButton.isEnabled = false
         skipButton.target = self;skipButton.action = #selector(skipRelease);skipButton.isEnabled = false
         remindButton.target = self;remindButton.action = #selector(remindLater)
-        var groups: [NSView] = productGroups?() ?? []
+        language.refresh()
+        // Every app lets the user pick its language here (本人 2026-10-18: a basic requirement for all apps).
+        var groups: [NSView] = [Self.group(LifecycleText.pick("Language", "语言"), rows: [language.row])]
+        if let hotKey = MenuBarHotKey.shared {
+            groups.append(Self.group(LifecycleText.pick("Menu Bar", "菜单栏"), rows: [
+                Self.row(LifecycleText.pick("Open the menu bar panel", "弹出菜单栏面板"), detail: hotKey.statusLabel, accessory: hotKey.recorder)]))
+        }
+        groups += productGroups?() ?? []
         if configuration?.hasSettings == true {
             cloudToggle.target = self; cloudToggle.action = #selector(toggleCloud)
-            let export = NSButton(title: "导出配置…", target: self, action: #selector(exportConfiguration))
-            let `import` = NSButton(title: "导入配置…", target: self, action: #selector(importConfiguration))
+            let export = NSButton(title: LifecycleText.pick("Export Settings…", "导出配置…"), target: self, action: #selector(exportConfiguration))
+            let `import` = NSButton(title: LifecycleText.pick("Import Settings…", "导入配置…"), target: self, action: #selector(importConfiguration))
             let transfers = NSStackView(views: [export, `import`]); transfers.spacing = 8
-            groups.append(Self.group("配置", rows: [
-                Self.row("使用 iCloud 记住配置", detail: Self.detailLabel("沿用系统 Apple ID；开启后自动记住设置，换机时恢复。权限和凭证保留在本机。"), accessory: cloudToggle),
-                Self.row("导入与导出", detail: syncStatus, accessory: transfers)]))
+            groups.append(Self.group(LifecycleText.pick("Settings", "配置"), rows: [
+                Self.row(LifecycleText.pick("Remember settings with iCloud", "使用 iCloud 记住配置"), detail: Self.detailLabel(LifecycleText.pick("Uses the system Apple ID. When on, settings are remembered and restored on a new Mac. Permissions and credentials stay on this Mac.", "沿用系统 Apple ID；开启后自动记住设置，换机时恢复。权限和凭证保留在本机。")), accessory: cloudToggle),
+                Self.row(LifecycleText.pick("Import and Export", "导入与导出"), detail: syncStatus, accessory: transfers)]))
         }
         let actions = NSStackView(views: [spinner, updateButton, installButton]); actions.spacing = 8
         let extras = NSStackView(views:[notesButton,skipButton,remindButton]);extras.spacing = 6
-        groups.append(Self.group("软件更新", rows: [
-            Self.row("当前版本 \(currentVersion) (\(currentBuild))", detail: status, accessory: actions),
-            Self.row("发行来源与检查记录",detail:updateDetails,accessory:channelPopup),
-            Self.row("自动检查更新",detail:Self.detailLabel("关闭时不轮询；开启后按所选间隔读取此发行源。"),accessory:checkToggle),
-            Self.row("检查间隔",accessory:intervalPopup),
-            Self.row("自动下载新版",detail:Self.detailLabel("只下载并验证，不自行替换；已验证的下载留在本机。"),accessory:downloadToggle),
-            Self.row("空闲时自动安装",detail:Self.detailLabel("开启后也会下载；你正在使用 App 或产品任务忙时延后。关闭自动检查会暂停这些自动行为，保留原选择。"),accessory:installToggle),
-            Self.row("版本选项",accessory:extras),Self.row("下载与验证",accessory:cancelButton)
+        groups.append(Self.group(LifecycleText.pick("Software Update", "软件更新"), rows: [
+            Self.row(LifecycleText.pick("Current version ", "当前版本 ") + "\(currentVersion) (\(currentBuild))", detail: status, accessory: actions),
+            Self.row(LifecycleText.pick("Release source and check history", "发行来源与检查记录"),detail:updateDetails,accessory:channelPopup),
+            Self.row(LifecycleText.pick("Check for updates automatically", "自动检查更新"),detail:Self.detailLabel(LifecycleText.pick("Off means no polling; on reads this release source at the chosen interval.", "关闭时不轮询；开启后按所选间隔读取此发行源。")),accessory:checkToggle),
+            Self.row(LifecycleText.pick("Check interval", "检查间隔"),accessory:intervalPopup),
+            Self.row(LifecycleText.pick("Download new versions automatically", "自动下载新版"),detail:Self.detailLabel(LifecycleText.pick("Only downloads and verifies, never replaces on its own; verified downloads stay on this Mac.", "只下载并验证，不自行替换；已验证的下载留在本机。")),accessory:downloadToggle),
+            Self.row(LifecycleText.pick("Install automatically when idle", "空闲时自动安装"),detail:Self.detailLabel(LifecycleText.pick("Also downloads when on; waits while you are using the app or it is busy. Turning off automatic checks pauses these and keeps your choices.", "开启后也会下载；你正在使用 App 或产品任务忙时延后。关闭自动检查会暂停这些自动行为，保留原选择。")),accessory:installToggle),
+            Self.row(LifecycleText.pick("Options", "版本选项"),accessory:extras),Self.row(LifecycleText.pick("Download and verification", "下载与验证"),accessory:cancelButton)
         ]))
         let stack = NSStackView(views: [header] + groups)
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 18
@@ -392,7 +500,7 @@ final class AppLifecycleUI: NSObject {
 
     private func refreshConfiguration() {
         cloudToggle.state = configuration?.enabled == true ? .on : .off
-        syncStatus.stringValue = configuration?.status ?? ""
+        syncStatus.stringValue = LifecycleText.display(configuration?.status ?? "")
     }
 
     /// Same window construction as the user-facing action; never orders a window in.
@@ -438,8 +546,8 @@ final class AppLifecycleUI: NSObject {
         panel.nameFieldStringValue = productName + "-config.json"
         panel.beginSheetModal(for: controller!.window!) { response in
             guard response == .OK, let url = panel.url else { return }
-            do { try configuration.exportData().write(to: url, options: .atomic); self.syncStatus.stringValue = "配置已导出。" }
-            catch { self.syncStatus.stringValue = "导出未完成：" + error.localizedDescription }
+            do { try configuration.exportData().write(to: url, options: .atomic); self.syncStatus.stringValue = LifecycleText.pick("Settings exported.", "配置已导出。") }
+            catch { self.syncStatus.stringValue = LifecycleText.pick("Export did not finish: ", "导出未完成：") + LifecycleText.display(error.localizedDescription) }
         }
     }
     @objc private func importConfiguration() {
@@ -447,19 +555,19 @@ final class AppLifecycleUI: NSObject {
         let panel = NSOpenPanel(); panel.allowsMultipleSelection = false; panel.canChooseDirectories = false
         panel.beginSheetModal(for: controller!.window!) { response in
             guard response == .OK, let url = panel.url else { return }
-            do { try configuration.importData(Data(contentsOf: url)); self.syncStatus.stringValue = "已导入；原配置已备份。" }
-            catch { self.syncStatus.stringValue = "导入未完成：" + error.localizedDescription }
+            do { try configuration.importData(Data(contentsOf: url)); self.syncStatus.stringValue = LifecycleText.pick("Imported; the previous settings were backed up.", "已导入；原配置已备份。") }
+            catch { self.syncStatus.stringValue = LifecycleText.pick("Import did not finish: ", "导入未完成：") + LifecycleText.display(error.localizedDescription) }
         }
     }
 
     @objc private func upgrade() {
         guard !working,let release,let url = release.downloadURL,release.isNewer(than:currentVersion,build:currentBuild) else { return }
         if !AppUpgradeInstaller.supportsReplacement(release:release,currentBundle:Bundle.main.bundleURL) {
-            NSWorkspace.shared.open(url);status.stringValue = "已打开正式安装包下载；配置保留。";return
+            NSWorkspace.shared.open(url);status.stringValue = LifecycleText.pick("Opened the official package download; settings are kept.", "已打开正式安装包下载；配置保留。");return
         }
-        let alert = NSAlert();alert.messageText = "升级 \(productName) 到 \(release.version) (\(release.build))？"
-        alert.informativeText = "验证发行包与签名后替换并重新打开；配置保留，失败回滚。下载和验证阶段可以取消。"
-        alert.addButton(withTitle:"升级");alert.addButton(withTitle:"取消")
+        let alert = NSAlert();alert.messageText = LifecycleText.pick("Update \(productName) to \(release.version) (\(release.build))?", "升级 \(productName) 到 \(release.version) (\(release.build))？")
+        alert.informativeText = LifecycleText.pick("The package and signature are verified, then the app is replaced and reopened. Settings are kept and a failure rolls back. You can cancel while downloading and verifying.", "验证发行包与签名后替换并重新打开；配置保留，失败回滚。下载和验证阶段可以取消。")
+        alert.addButton(withTitle:LifecycleText.pick("Update", "升级"));alert.addButton(withTitle:LifecycleText.pick("Cancel", "取消"))
         alert.beginSheetModal(for:controller!.window!) { [weak self] result in if result == .alertFirstButtonReturn { self?.prepareRelease(release,automatic:false) } }
     }
 }
@@ -771,7 +879,7 @@ enum AppUpgradeInstaller {
         started=1
         if ! verified_new; then started=0; fi
         if [ "$started" = 1 ] && [ "$relaunch" = 1 ]; then
-          if ! /usr/bin/open -g -j "$target_app"; then started=0; else
+          if ! /usr/bin/env -u TZ /usr/bin/open -g -j "$target_app"; then started=0; else
             started=0
             for ((attempt=0;attempt<40;attempt++)); do
               while IFS= read -r running; do
@@ -785,7 +893,7 @@ enum AppUpgradeInstaller {
         if [ "$started" != 1 ]; then
           /bin/mv "$target_app" "$task_dir/failed-new.app"
           if [ "$first_install" != 1 ]; then /bin/mv "$backup_app" "$target_app"; fi
-          if [ "$relaunch" = 1 ]; then /usr/bin/open -g -j "$target_app"; fi
+          if [ "$relaunch" = 1 ]; then /usr/bin/env -u TZ /usr/bin/open -g -j "$target_app"; fi
           exit 1
         fi
         if [ "$first_install" != 1 ] && ! retire_old "$backup_app" "${target_app##*/}"; then
@@ -801,7 +909,7 @@ enum AppUpgradeInstaller {
         try Data(body.utf8).write(to: script, options: .atomic)
         let process = Process(); process.executableURL = URL(fileURLWithPath: "/bin/bash")
         let backups = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Sift/UpgradeBackups/" + (Bundle(url: currentBundle)?.bundleIdentifier ?? "App"), isDirectory: true)
+            .appendingPathComponent("TianliApps/UpgradeBackups/" + (Bundle(url: currentBundle)?.bundleIdentifier ?? "App"), isDirectory: true)
         let environment = ProcessInfo.processInfo.environment
         let isolatedRoot = environment["APP_LIFECYCLE_SUPPORT_DIR"].map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path + "/" }
         let noRelaunch = environment["APP_LIFECYCLE_NO_RELAUNCH"] == "1" && isolatedRoot.map { currentBundle.resolvingSymlinksInPath().path.hasPrefix($0) } == true
@@ -834,6 +942,463 @@ enum AppUpgradeInstaller {
         let output = pipe.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
         guard process.terminationStatus == 0 else { throw AppUpdateError("安装包验证失败：" + String(decoding: output.prefix(4096), as: UTF8.self)) }
         return String(decoding: output, as: UTF8.self)
+    }
+}
+/// 常驻菜单栏 (本人 2026-10-20, like Raycast): closing the main window only hides it, the app keeps running in the
+/// menu bar. While a main window (or the settings window) is open the app is in ⌘Tab and the Dock; once the last one
+/// closes it leaves both. ⌘Q only closes the windows; the real quit is 退出 in the menu bar drop-down, which calls
+/// `NSApp.terminate` directly, as do logout and `<app> app quit`. A product calls `MenuBarResident.install()` once at
+/// launch; instances run with `.prohibited` (self-tests, quiet lanes) are left alone. The product's app delegate must also
+/// return false from `applicationShouldTerminateAfterLastWindowClosed`: SwiftUI does not count `MenuBarExtra(isInserted:)`
+/// as keeping the app alive, so closing the last window would otherwise quit it.
+final class MenuBarResident: NSObject {
+    private(set) static var shared: MenuBarResident?
+    private var observers: [NSObjectProtocol] = []
+    private var keyMonitor: Any?
+
+    static func install() {
+        guard shared == nil else { return }
+        let resident = MenuBarResident()
+        shared = resident
+        resident.start()
+    }
+
+    /// A window that makes the app a regular one: titled, open or minimized; not a panel, the menu bar drop-down or a
+    /// status bar window.
+    static func isMainWindow(_ window: NSWindow) -> Bool {
+        let name = String(describing: type(of: window))
+        return (window.isVisible || window.isMiniaturized) && window.styleMask.contains(.titled) && !(window is NSPanel)
+            && !name.contains("MenuBarExtra") && !name.contains("StatusBar")
+    }
+    static var hasMainWindow: Bool { NSApp.windows.contains(where: isMainWindow) }
+
+    /// ⌘Q: close the main windows instead of quitting.
+    static func closeMainWindows() {
+        for window in NSApp.windows where isMainWindow(window) { window.performClose(nil) }
+    }
+
+    private func start() {
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didChangeOcclusionStateNotification, NSWindow.willCloseNotification,
+                     NSWindow.didMiniaturizeNotification, NSWindow.didDeminiaturizeNotification] {
+            // After the run loop turn, so a closing window is already gone from the count.
+            observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                DispatchQueue.main.async { self?.update() }
+            })
+        }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+                  event.charactersIgnoringModifiers?.lowercased() == "q" else { return event }
+            Self.closeMainWindows()
+            return nil
+        }
+        // A normal launch opens the main window a moment after this runs; decide once it had the chance.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.update() }
+    }
+
+    func update() {
+        let current = NSApp.activationPolicy()
+        guard current != .prohibited else { return }
+        let wanted: NSApplication.ActivationPolicy = Self.hasMainWindow ? .regular : .accessory
+        guard current != wanted else { return }
+        NSApp.setActivationPolicy(wanted)
+        // Leaving .accessory drops the app behind the others; the window that just opened should be in front.
+        if wanted == .regular { NSApp.activate(ignoringOtherApps: true) }
+    }
+}
+/// One global shortcut that opens this app's menu bar drop-down from anywhere, like Itsycal (本人 2026-10-20: the
+/// drop-down had no shortcut; the main window is called up by Initials, not by this). Carbon `RegisterEventHotKey`, so no Accessibility permission. A product
+/// calls `MenuBarHotKey.install(default:)` once at launch; the shared settings window then shows a "Menu Bar" row
+/// where the shortcut is recorded again or cleared. Without `action` the app's own status item is clicked, which works
+/// for an `NSStatusItem` (menu or popover) and for SwiftUI `MenuBarExtra` alike. Main thread only, like the settings window.
+final class MenuBarHotKey: NSObject {
+    struct Chord: Equatable {
+        var code: UInt32
+        var modifiers: UInt32
+        static let allowed = UInt32(cmdKey | controlKey | optionKey | shiftKey)
+        /// "⌃⌥T", "⌘⇧Space" or "ctrl+opt+t"; nil when a key or modifier is not known.
+        init?(_ text: String) {
+            var rest = Substring(text.trimmingCharacters(in: .whitespaces)), mods = 0
+            let names: [String: Int] = ["⌘": cmdKey, "cmd": cmdKey, "command": cmdKey, "⌃": controlKey, "ctrl": controlKey, "control": controlKey,
+                                        "⌥": optionKey, "opt": optionKey, "option": optionKey, "alt": optionKey, "⇧": shiftKey, "shift": shiftKey]
+            while let first = rest.first, let flag = names[String(first)] { mods |= flag; rest = rest.dropFirst() }
+            var parts = rest.split(separator: "+").map { String($0) }
+            guard let last = parts.popLast() else { return nil }
+            for part in parts { guard let flag = names[part.lowercased()] else { return nil }; mods |= flag }
+            guard let code = Self.keys.first(where: { $0.value.uppercased() == last.uppercased() })?.key else { return nil }
+            self.code = code; self.modifiers = UInt32(mods)
+        }
+        init(code: UInt32, modifiers: UInt32) { self.code = code; self.modifiers = modifiers & Self.allowed }
+        init(_ event: NSEvent) {
+            var mods = 0
+            if event.modifierFlags.contains(.command) { mods |= cmdKey }
+            if event.modifierFlags.contains(.control) { mods |= controlKey }
+            if event.modifierFlags.contains(.option) { mods |= optionKey }
+            if event.modifierFlags.contains(.shift) { mods |= shiftKey }
+            self.init(code: UInt32(event.keyCode), modifiers: UInt32(mods))
+        }
+        var label: String {
+            [(controlKey, "⌃"), (optionKey, "⌥"), (shiftKey, "⇧"), (cmdKey, "⌘")].filter { modifiers & UInt32($0.0) != 0 }.map(\.1).joined()
+                + (Self.keys[code] ?? "?")
+        }
+        /// The chord as an NSMenuItem key equivalent (US-layout characters, matching `keys`).
+        var keyEquivalent: String? {
+            guard let name = Self.keys[code] else { return nil }
+            func scalar(_ value: Int) -> String { String(Character(UnicodeScalar(UInt16(value))!)) }
+            switch name {
+            case "Space": return " "
+            case "Return": return "\r"
+            case "←": return scalar(NSLeftArrowFunctionKey)
+            case "→": return scalar(NSRightArrowFunctionKey)
+            case "↓": return scalar(NSDownArrowFunctionKey)
+            case "↑": return scalar(NSUpArrowFunctionKey)
+            default:
+                if name.count > 1, name.hasPrefix("F"), let n = Int(name.dropFirst()) { return scalar(NSF1FunctionKey + n - 1) }
+                return name.lowercased()
+            }
+        }
+        var modifierFlags: NSEvent.ModifierFlags {
+            var flags: NSEvent.ModifierFlags = []
+            if modifiers & UInt32(cmdKey) != 0 { flags.insert(.command) }
+            if modifiers & UInt32(controlKey) != 0 { flags.insert(.control) }
+            if modifiers & UInt32(optionKey) != 0 { flags.insert(.option) }
+            if modifiers & UInt32(shiftKey) != 0 { flags.insert(.shift) }
+            return flags
+        }
+        /// Needs ⌘, ⌃ or ⌥ so plain typing is never taken, and a key this table can name.
+        var isUsable: Bool { Self.keys[code] != nil && modifiers & UInt32(cmdKey | controlKey | optionKey) != 0 }
+        /// Key codes are positions on the US layout.
+        static let keys: [UInt32: String] = [
+            0: "A", 1: "S", 2: "D", 3: "F", 4: "H", 5: "G", 6: "Z", 7: "X", 8: "C", 9: "V", 11: "B", 12: "Q", 13: "W", 14: "E", 15: "R",
+            16: "Y", 17: "T", 18: "1", 19: "2", 20: "3", 21: "4", 22: "6", 23: "5", 24: "=", 25: "9", 26: "7", 27: "-", 28: "8", 29: "0",
+            30: "]", 31: "O", 32: "U", 33: "[", 34: "I", 35: "P", 37: "L", 38: "J", 39: "'", 40: "K", 41: ";", 42: "\\", 43: ",", 44: "/",
+            45: "N", 46: "M", 47: ".", 50: "`", 49: "Space", 36: "Return", 123: "←", 124: "→", 125: "↓", 126: "↑",
+            122: "F1", 120: "F2", 99: "F3", 118: "F4", 96: "F5", 97: "F6", 98: "F7", 100: "F8", 101: "F9", 109: "F10", 103: "F11", 111: "F12"]
+    }
+
+    static let bindingKey = "menuBarHotKey.binding"
+    static let portableKeys = [bindingKey]
+    private(set) static var shared: MenuBarHotKey?
+    let defaults: UserDefaults
+    let fallback: Chord?
+    private let action: () -> Void
+    private var ref: EventHotKeyRef?
+    private var handler: EventHandlerRef?
+    private var monitor: Any?
+    private var trackedMenu: NSMenu?
+    private var closeItem: NSMenuItem?
+    private var menuObservers: [NSObjectProtocol] = []
+    private var windowObservers: [NSObjectProtocol] = []
+    private var retries = 0
+    private(set) var error: String?
+    lazy var recorder: NSButton = {
+        let button = NSButton(title: "", target: self, action: #selector(startRecording))
+        button.bezelStyle = .rounded; button.widthAnchor.constraint(greaterThanOrEqualToConstant: 96).isActive = true
+        return button
+    }()
+    let statusLabel = AppLifecycleUI.detailLabel()
+
+    /// The stored chord; "" in defaults means the owner cleared it. Missing means the product default.
+    var chord: Chord? {
+        guard let text = defaults.string(forKey: Self.bindingKey) else { return fallback }
+        return text.isEmpty ? nil : Chord(text)
+    }
+
+    /// Registers the shortcut now and adds its row to the settings window. `default` is a label such as "⌃⌥T".
+    @discardableResult
+    static func install(default label: String?, defaults: UserDefaults = .standard, action: (() -> Void)? = nil) -> MenuBarHotKey {
+        if let shared { return shared }
+        let hotKey = MenuBarHotKey(fallback: label.flatMap(Chord.init), defaults: defaults, action: action ?? { Self.openStatusItem() })
+        shared = hotKey
+        hotKey.register()
+        hotKey.watchStatusMenu()
+        return hotKey
+    }
+
+    private init(fallback: Chord?, defaults: UserDefaults, action: @escaping () -> Void) {
+        self.fallback = fallback; self.defaults = defaults; self.action = action
+        super.init()
+    }
+
+    /// Saves a new chord (nil clears it) and registers it; returns the reason when the system refused it.
+    @discardableResult
+    func set(_ chord: Chord?) -> String? {
+        defaults.set(chord?.label ?? "", forKey: Self.bindingKey)
+        retries = 0
+        register()
+        return error
+    }
+
+    func register() {
+        unregister()
+        error = nil
+        if let chord = chord {
+            if !chord.isUsable {
+                error = LifecycleText.pick("Use ⌘, ⌃ or ⌥ with a letter, digit or F-key.", "请用 ⌘、⌃ 或 ⌥ 加字母、数字或 F 键。")
+            } else {
+                installHandler()
+                var hotKey: EventHotKeyRef?
+                // Exclusive: an app already holding this chord makes registration fail, so the conflict is shown here.
+                let rc = RegisterEventHotKey(chord.code, chord.modifiers, EventHotKeyID(signature: Self.signature, id: 1),
+                                             GetApplicationEventTarget(), OptionBits(kEventHotKeyExclusive), &hotKey)
+                if rc == noErr { ref = hotKey; retries = 0 } else if rc == OSStatus(eventHotKeyExistsErr), retries < 15 {
+                    // Usually this app's previous instance, still quitting after a relaunch or install: try again shortly.
+                    retries += 1
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in if self?.ref == nil, self?.monitor == nil { self?.register() } }
+                    error = LifecycleText.pick("\(chord.label) is taken by another app or the system; record another.",
+                                               "\(chord.label) 已被别的 App 或系统占用，请换一个组合。")
+                } else {
+                    error = LifecycleText.pick("\(chord.label) is taken by another app or the system; record another.",
+                                               "\(chord.label) 已被别的 App 或系统占用，请换一个组合。")
+                }
+            }
+        }
+        refreshRow()
+    }
+
+    private func unregister() {
+        if let ref { UnregisterEventHotKey(ref); self.ref = nil }
+    }
+
+    private static let signature: OSType = 0x4D42_484B // "MBHK"
+
+    private func installHandler() {
+        guard handler == nil else { return }
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, context in
+            guard let event, let context else { return OSStatus(eventNotHandledErr) }
+            var key = EventHotKeyID()
+            let rc = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil,
+                                       MemoryLayout<EventHotKeyID>.size, nil, &key)
+            guard rc == noErr, key.signature == MenuBarHotKey.signature else { return OSStatus(eventNotHandledErr) }
+            let hotKey = Unmanaged<MenuBarHotKey>.fromOpaque(context).takeUnretainedValue()
+            // After the Carbon dispatch returns: a menu click blocks for the whole menu session, and the begin-tracking
+            // observer releases this very hot key.
+            if hotKey.monitor == nil { DispatchQueue.main.async { hotKey.action() } }
+            return noErr
+        }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &handler)
+    }
+
+    /// This app's own status item (each display has a replica window; only the real one owns the button).
+    static func ownStatusItem() -> NSStatusItem? {
+        let key = NSSelectorFromString("statusItem")
+        for window in NSApp.windows where String(describing: type(of: window)).contains("StatusBarWindow") && window.responds(to: key) {
+            guard let item = window.value(forKey: "statusItem") as? NSStatusItem, let button = item.button, button.window === window else { continue }
+            return item
+        }
+        return nil
+    }
+
+    /// Opens this app's own menu bar drop-down the way a click on its icon does; a second press closes it. macOS 27 drives
+    /// SwiftUI `MenuBarExtra(.window)` through the status item's expanded-interface session (its button has no
+    /// target/action, so a simulated click does nothing). An `NSStatusItem` menu takes the button click, which tracks the
+    /// menu modally; while it is open the chord is handled by `watchStatusMenu()`, since Carbon hot keys wait until the
+    /// menu closes. The app is not activated, matching a real click.
+    @discardableResult
+    static func openStatusItem() -> Bool {
+        guard let item = ownStatusItem(), let button = item.button, item.isVisible else { return false }
+        if #available(macOS 27.0, *), item.expandedInterfaceDelegate != nil {
+            if let session = item.expandedInterfaceSession {
+                _ = (session as AnyObject).perform(NSSelectorFromString("cancel"))
+                return true
+            }
+            let request = NSSelectorFromString("_requestExpandedInterfaceSession")
+            guard item.responds(to: request) else { return false }
+            _ = item.perform(request)
+            return true
+        }
+        button.performClick(nil)
+        return true
+    }
+
+    /// While this app's NSMenu drop-down is open, the chord is released (the window server would otherwise hold the press
+    /// until the menu closes and then reopen it) and a hidden item with the same key equivalent closes the menu; the
+    /// registration comes back when tracking ends. Covers a drop-down opened by mouse as well.
+    private func watchStatusMenu() {
+        guard menuObservers.isEmpty else { return }
+        let center = NotificationCenter.default
+        menuObservers.append(center.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: nil) { [weak self] note in
+            guard let self, self.ref != nil, self.monitor == nil, let chord = self.chord, let menu = note.object as? NSMenu,
+                  menu === Self.ownStatusItem()?.menu, let equivalent = chord.keyEquivalent else { return }
+            self.trackedMenu = menu
+            self.unregister()
+            let item = NSMenuItem(title: "", action: #selector(self.closeFromMenu(_:)), keyEquivalent: equivalent)
+            item.keyEquivalentModifierMask = chord.modifierFlags
+            item.target = self; item.isHidden = true; item.allowsKeyEquivalentWhenHidden = true
+            self.closeItem = item
+            self.ensureCloseItem()
+        })
+        // A product that rebuilds its menu as it opens (menuNeedsUpdate / menuWillOpen) drops the item; put it back.
+        for name in [NSMenu.didRemoveItemNotification, NSMenu.didAddItemNotification] {
+            menuObservers.append(center.addObserver(forName: name, object: nil, queue: nil) { [weak self] note in
+                guard let self, let menu = note.object as? NSMenu, menu === self.trackedMenu else { return }
+                RunLoop.main.perform(inModes: [.common]) { [weak self] in self?.ensureCloseItem() }
+            })
+        }
+        menuObservers.append(center.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: nil) { [weak self] note in
+            guard let self, let menu = note.object as? NSMenu, menu === self.trackedMenu else { return }
+            if let item = self.closeItem, item.menu === menu { menu.removeItem(item) }
+            self.closeItem = nil; self.trackedMenu = nil
+            if self.monitor == nil { self.register() }
+        })
+    }
+
+    private func ensureCloseItem() {
+        guard let menu = trackedMenu, let item = closeItem, item.menu == nil else { return }
+        menu.addItem(item)
+    }
+
+    /// Choosing the hidden item is what closes the menu; nothing else to do.
+    @objc private func closeFromMenu(_ sender: Any?) {}
+
+    private func refreshRow() {
+        if monitor != nil {
+            recorder.title = LifecycleText.pick("Press keys…", "请按组合键…")
+            statusLabel.stringValue = LifecycleText.pick("Esc cancels, Delete clears.", "Esc 取消，Delete 清除。")
+            return
+        }
+        recorder.title = chord?.label ?? LifecycleText.pick("Record", "录制")
+        if let error { statusLabel.stringValue = error; statusLabel.textColor = .systemRed; return }
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.stringValue = chord == nil
+            ? LifecycleText.pick("Off. Click to record a shortcut.", "未设置。点按钮录制一个组合。")
+            : LifecycleText.pick("Works from any app; press again to close. Click to change.", "在任何 App 里都能按；再按一次收起。点按钮可改。")
+    }
+
+    @objc private func startRecording() {
+        guard monitor == nil else { return }
+        unregister()
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, event.window === self.recorder.window else { return event }
+            switch event.keyCode {
+            case 53: self.stopRecording(nil, keep: true)
+            case 51, 117: self.stopRecording(nil, keep: false)
+            default:
+                let chord = Chord(event)
+                guard chord.isUsable else { NSSound.beep(); return nil }
+                self.stopRecording(chord, keep: false)
+            }
+            return nil
+        }
+        if let window = recorder.window {
+            windowObservers = [NSWindow.willCloseNotification, NSWindow.didResignKeyNotification].map {
+                NotificationCenter.default.addObserver(forName: $0, object: window, queue: .main) { [weak self] _ in self?.stopRecording(nil, keep: true) }
+            }
+        }
+        refreshRow()
+    }
+
+    private func stopRecording(_ chord: Chord?, keep: Bool) {
+        guard monitor != nil else { return }
+        windowObservers.forEach(NotificationCenter.default.removeObserver); windowObservers = []
+        if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
+        if keep { register() } else { set(chord) }
+    }
+}
+/// The 界面语言 row — the one implementation every settings page uses: the shared window, and a product's own AppKit
+/// settings page via `LifecycleLanguageRow.group()` (put it first). SwiftUI pages use `LifecycleLanguagePicker`.
+final class LifecycleLanguageRow: NSObject {
+    let popup = NSPopUpButton()
+    let note = AppLifecycleUI.detailLabel()
+    let reopen = NSButton(title: LifecycleText.pick("Reopen Now", "立即重新打开"), target: nil, action: nil)
+    /// The finished row (title, note, picker and Reopen Now); it keeps this controller alive.
+    private(set) var row: NSView = NSView()
+
+    override init() {
+        super.init()
+        popup.addItems(withTitles: LifecycleLanguage.allCases.map(\.title))
+        popup.target = self; popup.action = #selector(changed)
+        popup.setAccessibilityIdentifier("appLanguage")
+        reopen.target = self; reopen.action = #selector(reopenNow)
+        let controls = NSStackView(views: [popup, reopen]); controls.spacing = 8
+        let built = AppLifecycleUI.row(LifecycleText.pick("App language", "界面语言"), detail: note, accessory: controls)
+        objc_setAssociatedObject(built, Unmanaged.passUnretained(self).toOpaque(), self, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        row = built
+        refresh()
+    }
+    /// The whole 语言 group (caption and card) for a product's own AppKit settings page.
+    static func group() -> NSView {
+        AppLifecycleUI.group(LifecycleText.pick("Language", "语言"), rows: [LifecycleLanguageRow().row])
+    }
+    func refresh() {
+        popup.selectItem(at: LifecycleLanguage.allCases.firstIndex(of: LifecycleLanguage.current) ?? 0)
+        let pending = LifecycleLanguage.needsRelaunch
+        note.stringValue = pending ? LifecycleText.pick("Takes effect after the app reopens.", "重新打开 App 后生效。")
+            : LifecycleText.pick("Menus, windows and system panels switch together.", "菜单、窗口和系统面板一起切换。")
+        reopen.isHidden = !pending
+    }
+    @objc private func changed() { LifecycleLanguage.set(LifecycleLanguage.allCases[max(0, popup.indexOfSelectedItem)]); refresh() }
+    @objc private func reopenNow() { LifecycleLanguage.relaunch() }
+}
+
+/// The 界面语言 row for a SwiftUI settings page (put it first, inside the page's own Form/Section):
+/// the same choice, note and Reopen Now as `LifecycleLanguageRow`.
+@available(macOS 11.0, *)
+struct LifecycleLanguagePicker: SwiftUI.View {
+    @SwiftUI.State private var choice = LifecycleLanguage.current
+    @SwiftUI.State private var pending = LifecycleLanguage.needsRelaunch
+    var body: some SwiftUI.View {
+        SwiftUI.VStack(alignment: .leading, spacing: 4) {
+            SwiftUI.HStack {
+                SwiftUI.Picker(LifecycleText.pick("App language", "界面语言"), selection: SwiftUI.Binding(get: { choice }, set: { value in
+                    choice = value; LifecycleLanguage.set(value); pending = LifecycleLanguage.needsRelaunch
+                })) {
+                    SwiftUI.ForEach(LifecycleLanguage.allCases, id: \.self) { option in SwiftUI.Text(option.title).tag(option) }
+                }
+                .accessibilityIdentifier("appLanguage")
+                if pending { SwiftUI.Button(LifecycleText.pick("Reopen Now", "立即重新打开")) { LifecycleLanguage.relaunch() } }
+            }
+            SwiftUI.Text(pending ? LifecycleText.pick("Takes effect after the app reopens.", "重新打开 App 后生效。")
+                 : LifecycleText.pick("Menus, windows and system panels switch together.", "菜单、窗口和系统面板一起切换。"))
+                .font(.caption).foregroundColor(.secondary)
+        }
+        .onAppear { choice = LifecycleLanguage.current; pending = LifecycleLanguage.needsRelaunch }
+    }
+}
+
+/// The app's own language choice: Follow System, 简体中文 or English. Stored as this app's `AppleLanguages`
+/// override, which macOS applies at the next launch (the same mechanism as System Settings → Language & Region
+/// → Applications), so menus, windows and system panels switch together. Follow System removes the override.
+enum LifecycleLanguage: String, CaseIterable {
+    case system, chinese = "zh-Hans", english = "en"
+    static let key = "AppleLanguages"
+    /// The defaults domain holding the override; tests point it at an isolated domain.
+    static var domain = Bundle.main.bundleIdentifier ?? ""
+    /// Each option is shown in its own language, so it can be found from either interface.
+    var title: String {
+        switch self {
+        case .system: return LifecycleText.pick("Follow System", "跟随系统")
+        case .chinese: return "简体中文"
+        case .english: return "English"
+        }
+    }
+    /// Only this app's own domain counts; the global list is the system language, not a choice.
+    static var current: LifecycleLanguage {
+        guard !domain.isEmpty, let code = (UserDefaults.standard.persistentDomain(forName: domain)?[key] as? [String])?.first?.lowercased()
+        else { return .system }
+        return code.hasPrefix("zh") ? .chinese : (code.hasPrefix("en") ? .english : .system)
+    }
+    static func set(_ choice: LifecycleLanguage) {
+        guard !domain.isEmpty else { return }
+        var values = UserDefaults.standard.persistentDomain(forName: domain) ?? [:]
+        values[key] = choice == .system ? nil : [choice.rawValue]
+        UserDefaults.standard.setPersistentDomain(values, forName: domain)
+    }
+    /// The interface language the saved choice resolves to at the next launch.
+    static var resolved: LifecycleText.Language {
+        switch current {
+        case .system: return LifecycleText.resolve(UserDefaults.standard.persistentDomain(forName: UserDefaults.globalDomain)?[key] as? [String] ?? Locale.preferredLanguages)
+        case .chinese: return .chinese
+        case .english: return .english
+        }
+    }
+    static var needsRelaunch: Bool { resolved != LifecycleText.language }
+    /// Opens a fresh instance of this app, then quits this one.
+    static func relaunch() {
+        let config = NSWorkspace.OpenConfiguration()
+        config.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: config) { _, error in
+            DispatchQueue.main.async { if error == nil { NSApp.terminate(nil) } }
+        }
     }
 }
 #endif

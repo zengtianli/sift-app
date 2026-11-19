@@ -39,6 +39,8 @@ void sift_engine_status(const SiftEngine *engine, SiftStatus *out);
 void sift_engine_rescan(const SiftEngine *engine);
 // Rich status and runtime controls use the same Service path as the CLI socket.
 char *sift_engine_details(const SiftEngine *engine);
+// Frequent UI refresh: index state only; no permissions/login-item/bundle probes.
+char *sift_engine_index_details(const SiftEngine *engine);
 char *sift_remote_status(const char *support_dir);
 char *sift_engine_control(const SiftEngine *engine, const char *json);
 char *sift_results_locate(const SiftEngine *engine, const SiftResults *results, const char *paths_json);

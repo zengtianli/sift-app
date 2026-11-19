@@ -40,7 +40,7 @@ enum IndexAccess {
     /// The status line of the search window while nothing is granted.
     static var explanation: String {
         if let problem { return problem }
-        return "Sift searches the folders you allow. Choose \(startupDiskName) to search the whole Mac."
+        return SiftText.value("store.access.explanation", fallback:String(localized: "Choose a folder to index. Locations protected by macOS remain subject to system restrictions.", table: "Settings"))
     }
     static var startupDiskName: String { FileManager.default.displayName(atPath: "/") }
 
@@ -52,7 +52,12 @@ enum IndexAccess {
         setenv("SIFT_NO_IPC", "1", 1)         // core/src/ffi.rs: this build ships without the `sift` CLI
         placeholder = supportDirectory.appendingPathComponent("NoFolderGranted", isDirectory: true)
         try? FileManager.default.createDirectory(at: placeholder, withIntermediateDirectories: true)
-        restore()
+        // The existing UI self-test indexes only its own container fixture. This
+        // supplies UI context, never evidence of a real open-panel security grant.
+        if Prefs.readOnly, CommandLine.arguments.contains("--ui-self-test"), let fixture = testGrant,
+           fixture.resolvingSymlinksInPath().path.hasPrefix(supportDirectory.deletingLastPathComponent().resolvingSymlinksInPath().path + "/") {
+            granted = fixture
+        } else { restore() }
         // A first start has no config.json; the core's default root is then this folder instead of `/`.
         setenv("SIFT_DEFAULT_ROOT", rootPath, 1)
         if !Prefs.readOnly { enforceRoot(in: supportDirectory.appendingPathComponent("config.json")) }
@@ -75,14 +80,14 @@ enum IndexAccess {
             let url = resolved.standardizedFileURL // the spelling `grant` stored as the root
             guard readableFolder(url) else {
                 if scoped { resolved.stopAccessingSecurityScopedResource() }
-                problem = "Sift can no longer reach “\(url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent)”. Choose the folder to index again."
+                problem = String(localized: "Sift can no longer access “\(url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent)”. Choose the folder to index again.", table: "Settings")
                 return
             }
             granted = url
             // The system asks for a fresh bookmark after the folder moved or the system was updated.
             if stale, !Prefs.readOnly, let fresh = try? bookmark(url) { UserDefaults.standard.set(fresh, forKey: bookmarkKey) }
         } catch {
-            problem = "Sift could not reopen the folder it indexed (\(error.localizedDescription)). Choose it again."
+            problem = String(localized: "Sift could not reopen the indexed folder (\(error.localizedDescription)). Choose it again.", table: "Settings")
         }
     }
 
@@ -130,8 +135,9 @@ enum IndexAccess {
         panel.allowsMultipleSelection = false
         panel.canCreateDirectories = false
         panel.directoryURL = URL(fileURLWithPath: "/", isDirectory: true)
-        panel.message = "Choose what Sift may index. To search the whole Mac, stay on \(startupDiskName) and click Allow; or pick one folder."
-        panel.prompt = "Allow"
+        panel.message = SiftText.value("store.access.panel", fallback:String(localized: "Choose a folder Sift may index. Protected locations remain subject to macOS restrictions.", table: "Settings"))
+            .replacingOccurrences(of:"{disk}",with:startupDiskName)
+        panel.prompt = String(localized: "Allow", table: "Settings")
         let done: (NSApplication.ModalResponse) -> Void = { completion($0 == .OK ? panel.url : nil) }
         if let window, window.isVisible { panel.beginSheetModal(for: window, completionHandler: done) } else { panel.begin(completionHandler: done) }
     }
@@ -141,15 +147,15 @@ enum IndexAccess {
     @discardableResult
     static func grant(_ url: URL, engine: Engine) -> String? {
         let url = url.standardizedFileURL
-        guard readableFolder(url) else { return "Sift cannot read “\(url.path)”." }
+        guard readableFolder(url) else { return String(localized: "Sift cannot read “\(url.path)”.", table: "Settings") }
         guard let current = engine.settingsJSON(), var object = (try? JSONSerialization.jsonObject(with: current)) as? [String: Any] else {
-            return "Sift could not read its settings."
+            return String(localized: "Sift could not read its settings.", table: "Settings")
         }
         let previous = (granted, problem)
         granted = url
         problem = nil
         object["root"] = url.path
-        guard let settings = try? JSONSerialization.data(withJSONObject: object) else { return "Sift could not write its settings." }
+        guard let settings = try? JSONSerialization.data(withJSONObject: object) else { return String(localized: "Sift could not write its settings.", table: "Settings") }
         if let error = engine.updateSettings(settings) {
             (granted, problem) = previous
             return error

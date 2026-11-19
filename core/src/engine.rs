@@ -45,6 +45,10 @@ pub static QUIT: AtomicBool = AtomicBool::new(false);
 /// FSEvents coalescing window. Cardinal uses 0.1s; a wider window batches bursts
 /// (builds, git checkouts) into fewer wakeups while keeping results fresh.
 const FSE_LATENCY_SECS: f64 = 0.5;
+/// Replays that make no progress (the same loss again) before the full background repair.
+const MAX_REPLAYS: u32 = 2;
+/// Upper bound on replays in one loss episode even while each one makes progress.
+const MAX_EPISODE_REPLAYS: u32 = 64;
 /// Housekeeping tick.
 const TICK: Duration = Duration::from_secs(30);
 /// Only flush a changed index after this long without searches…
@@ -109,6 +113,17 @@ pub struct Status {
     pub rebuild_reason: Mutex<String>,
     /// A background repair walk is running; searches keep using the last snapshot.
     pub repairing: AtomicBool,
+    /// The last background repair did not finish or could not be saved; it will be
+    /// retried with backoff. The window only turns its notice orange for this.
+    pub repair_failed: AtomicBool,
+    /// FSEvents batches that carried a history loss since launch (every one, not
+    /// only the first of an episode that `rebuild.log` records).
+    pub history_losses: AtomicU64,
+    /// Delivery losses recovered by replaying FSEvents history instead of a walk.
+    pub history_replays: AtomicU64,
+    /// FSEvents batches delivered but not yet applied. Counts, file totals and loss
+    /// figures read while this is above zero are mid-catch-up, not results.
+    pub pending_event_batches: AtomicU64,
     /// Completed full walks (first index, manual rescan, settings change, background repair).
     /// `rescans` counts only FSEvents rescan requests, so waiting for a rebuild watches this.
     pub walks: AtomicU64,
@@ -475,6 +490,20 @@ struct Loop {
     pending_rebuild_commit: bool,
     repair: Option<Repair>,
     host: HostLoad,
+    /// Event ID and wall-clock second the current FSEvents stream replays from;
+    /// written into every rebuild reason so a history loss can be traced later.
+    watcher_since: (u64, u64),
+    /// Highest event ID up to which every event was delivered (no loss in or before
+    /// its batch); a replay restarts here.
+    last_clean_id: u64,
+    /// Replays that met a loss at or before the previous one (no progress): a gap
+    /// stored in the history. `MAX_REPLAYS` of them fall back to the full repair.
+    replays: u32,
+    /// All replays in the current loss episode; sustained overload keeps losing at
+    /// later IDs and keeps replaying, up to `MAX_EPISODE_REPLAYS`.
+    episode_replays: u32,
+    /// Highest event ID of the last loss replayed in this episode.
+    last_loss_id: u64,
 }
 
 /// A repair walk on its own thread and the small background pool, so the loop keeps
@@ -534,6 +563,11 @@ fn run(config: Config, rx: Receiver<Cmd>, status: Arc<Status>, settings: Arc<Mut
         last_flush: None,
         recovery: RecoverySchedule::default(),
         pending_rebuild_commit: false,
+        watcher_since: (0, 0),
+        last_clean_id: 0,
+        replays: 0,
+        episode_replays: 0,
+        last_loss_id: 0,
         repair: None,
         host: HostLoad::default(),
     };
@@ -556,9 +590,11 @@ fn run(config: Config, rx: Receiver<Cmd>, status: Arc<Status>, settings: Arc<Mut
                 if let Ok(events) = events {
                     state.apply_events(events);
                 }
+                state.status.pending_event_batches.store(state.watcher.len() as u64, Ordering::Relaxed);
             }
             recv(repair_done) -> cache => state.finish_repair(cache.ok().flatten()),
             recv(ticker) -> _ => {
+                state.status.pending_event_batches.store(state.watcher.len() as u64, Ordering::Relaxed);
                 state.maybe_recover();
                 state.maybe_idle_flush();
             },
@@ -672,6 +708,63 @@ impl Loop {
         }
     }
 
+    /// FSEvents reports `UserDropped` when events did not reach this process in time
+    /// (its delivery buffer overflowed under load); fseventsd's on-disk history still
+    /// holds them. Replaying from the last clean event ID recovers them in seconds,
+    /// where a full walk takes minutes and a 130 MB snapshot. Losses recorded in the
+    /// history itself (kernel drops, a dirty shutdown) come back on every replay, so
+    /// after `MAX_REPLAYS` the caller falls back to the full repair.
+    fn can_replay(&self, rebuild: &[FsEvent]) -> bool {
+        rebuild.iter().all(|e| e.flag.contains(EventFlag::UserDropped)
+            && !e.flag.intersects(EventFlag::KernelDropped | EventFlag::EventIdsWrapped | EventFlag::RootChanged))
+            && (self.loss_id(rebuild) > self.last_loss_id || self.replays < MAX_REPLAYS)
+            && self.episode_replays < MAX_EPISODE_REPLAYS
+            && !self.status.rebuild_required.load(Ordering::Relaxed) && !self.pending_rebuild_commit
+    }
+
+    fn loss_id(&self, rebuild: &[FsEvent]) -> u64 { rebuild.iter().map(|e| e.id).max().unwrap_or(0) }
+
+    fn replay_after_delivery_loss(&mut self, rebuild: &[FsEvent], incremental: Vec<FsEvent>) {
+        let resume = self.last_clean_id;
+        // Changes delivered in this batch are applied now; the replay re-applies them
+        // (scanning a path is idempotent) together with whatever was dropped.
+        let cache = &mut self.cache;
+        let _ = crate::recovery::incremental(|| cache.handle_fs_events(incremental));
+        self.cache.rewind_last_event_id(resume);
+        let loss = self.loss_id(rebuild);
+        // A loss past the previous one means the last replay got further before the
+        // load overtook it again; the same loss again is a gap stored in the history.
+        self.replays = if loss > self.last_loss_id { 1 } else { self.replays + 1 };
+        self.last_loss_id = self.last_loss_id.max(loss);
+        self.episode_replays += 1;
+        self.status.history_losses.fetch_add(1, Ordering::Relaxed);
+        self.status.history_replays.fetch_add(1, Ordering::Relaxed);
+        let first = rebuild.first().map_or(0, |e| e.id);
+        let line = format!("replay {} from={resume} after flags={:?} id={first}; stream_since={}@{}",
+            self.replays, rebuild[0].flag, self.watcher_since.0, self.watcher_since.1);
+        info!("FSEvents delivery loss, {line}");
+        if self.episode_replays == 1 { self.log_rebuild(&line); }
+        self.watcher = EventWatcher::noop();
+        self.start_watcher();
+        self.status.files.store(self.cache.get_total_files(), Ordering::Relaxed);
+        self.status.index_revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Appends one line per history loss to `rebuild.log` (kept under 64 KiB), so
+    /// the cause survives the marker being cleared by a successful repair.
+    fn log_rebuild(&self, reason: &str) {
+        if std::env::var_os("SIFT_READONLY").is_some() { return; }
+        let path = self.config.support_dir.join("rebuild.log");
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 64 * 1024) {
+            let _ = std::fs::rename(&path, self.config.support_dir.join("rebuild.log.1"));
+        }
+        let line = format!("{} pid={} {reason}\n", unix_now(), std::process::id());
+        if let Err(e) = std::fs::OpenOptions::new().create(true).append(true).open(&path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes())) {
+            warn!("cannot append rebuild log: {e}");
+        }
+    }
+
     fn set_active_state(&self, state: EngineState) {
         self.status.set_state(if self.status.rebuild_required.load(Ordering::Relaxed) {
             EngineState::RebuildRequired
@@ -691,6 +784,8 @@ impl Loop {
             return;
         }
         self.set_active_state(EngineState::Updating);
+        self.watcher_since = (self.cache.last_event_id(), unix_now());
+        self.last_clean_id = self.watcher_since.0;
         self.watcher = EventWatcher::spawn(
             self.config.root.to_string_lossy().into_owned(),
             self.cache.last_event_id(),
@@ -823,12 +918,25 @@ impl Loop {
         // other paths, but retain the last known snapshot and expose the gap.
         let (rebuild, incremental): (Vec<_>, Vec<_>) = events.into_iter()
             .partition(|e| requires_rebuild(e, &self.config.root));
-        if !rebuild.is_empty() {
+        let lost = !rebuild.is_empty();
+        if lost && self.can_replay(&rebuild) {
+            self.replay_after_delivery_loss(&rebuild, incremental);
+            return;
+        }
+        if lost {
             self.pending_rebuild_commit = false;
-            *self.status.rebuild_reason.lock().unwrap() = rebuild.iter().map(|e|
-                format!("flags={:?}; at_root={}; ancestor_of_root={}", e.flag,
-                    e.path == self.config.root, self.config.root.starts_with(&e.path)))
+            let reason = rebuild.iter().map(|e|
+                format!("flags={:?}; at_root={}; ancestor_of_root={}; id={}; stream_since={}@{}; at={}", e.flag,
+                    e.path == self.config.root, self.config.root.starts_with(&e.path),
+                    e.id, self.watcher_since.0, self.watcher_since.1, unix_now()))
                 .collect::<Vec<_>>().join(" | ");
+            self.status.history_losses.fetch_add(1, Ordering::Relaxed);
+            // One line per episode: a burst delivers dozens of root losses in a second.
+            if !self.status.rebuild_required.load(Ordering::Relaxed) {
+                warn!("FSEvents history loss: {reason}");
+                self.log_rebuild(&reason);
+            }
+            *self.status.rebuild_reason.lock().unwrap() = reason;
             let _ = self.cache.handle_fs_events(rebuild);
             self.require_rebuild();
         }
@@ -841,6 +949,10 @@ impl Loop {
         // ID, and only commit after HistoryDone without any new history loss.
         if self.pending_rebuild_commit && self.history_done {
             self.commit_rebuilt_cache();
+        }
+        if !lost {
+            self.last_clean_id = self.cache.last_event_id();
+            if self.history_done { self.replays = 0; self.episode_replays = 0; self.last_loss_id = 0; }
         }
         self.status
             .files
@@ -894,6 +1006,7 @@ impl Loop {
             match repaired {
                 Ok(()) => {
                         self.status.rebuild_required.store(false, Ordering::Relaxed);
+                        self.status.repair_failed.store(false, Ordering::Relaxed);
                         self.status.rebuild_reason.lock().unwrap().clear();
                     self.record_flush();
                     self.pending_rebuild_commit = false;
@@ -901,6 +1014,7 @@ impl Loop {
                 }
                 Err(e) => {
                     self.pending_rebuild_commit = false;
+                    self.status.repair_failed.store(true, Ordering::Relaxed);
                     warn!("rebuilt index could not be committed; recovery will retry: {e:#}");
                 }
             }
@@ -912,8 +1026,7 @@ impl Loop {
         if QUIT.load(Ordering::Relaxed) || std::env::var_os("SIFT_READONLY").is_some()
             || self.status.paused.load(Ordering::Relaxed) || !self.status.auto_repair.load(Ordering::Relaxed)
             || self.pending_rebuild_commit || self.repair.is_some() { return; }
-        if self.recovery.due(Instant::now(), self.status.rebuild_required.load(Ordering::Relaxed),
-                             self.last_activity.elapsed(), host_busy) {
+        if self.recovery.due(Instant::now(), self.status.rebuild_required.load(Ordering::Relaxed), host_busy) {
             info!("repairing lost filesystem history on background threads");
             self.recovery.attempted(Instant::now());
             self.status.repairing.store(true, Ordering::Relaxed);
@@ -927,6 +1040,7 @@ impl Loop {
         self.cancel_repair();
         let Some(cache) = cache.filter(|_| !QUIT.load(Ordering::Relaxed)) else {
             if !QUIT.load(Ordering::Relaxed) {
+                self.status.repair_failed.store(true, Ordering::Relaxed);
                 warn!("background repair did not finish; it will be retried");
             }
             return;
@@ -1144,7 +1258,7 @@ mod rebuild_tests {
         let settings = Arc::new(Mutex::new(config.clone()));
         let mut state = Loop { config, settings, cache, watcher: EventWatcher::noop(), status: status.clone(),
             history_done: false, last_activity: Instant::now(), last_flush: None,
-            recovery: RecoverySchedule::default(), pending_rebuild_commit: false,
+            recovery: RecoverySchedule::default(), pending_rebuild_commit: false, watcher_since: (0, 0), last_clean_id: 0, replays: 0, episode_replays: 0, last_loss_id: 0,
             repair: None, host: HostLoad::default() };
         let added = root.join("added.txt");
         std::fs::write(&added, "new").unwrap();
@@ -1195,9 +1309,9 @@ mod rebuild_tests {
         let mut state = Loop { config: config.clone(), settings: Arc::new(Mutex::new(config.clone())),
             cache: SearchCache::walk_fs(&root), watcher: EventWatcher::noop(),
             status: status.clone(), history_done: false, last_activity: Instant::now(), last_flush: None,
-            recovery: RecoverySchedule::default(), pending_rebuild_commit: false,
+            recovery: RecoverySchedule::default(), pending_rebuild_commit: false, watcher_since: (0, 0), last_clean_id: 0, replays: 0, episode_replays: 0, last_loss_id: 0,
             repair: None, host: HostLoad::default() };
-        state.apply_events(vec![FsEvent { path: root.clone(), flag: EventFlag::UserDropped, id: 1 }]);
+        state.apply_events(vec![FsEvent { path: root.clone(), flag: EventFlag::KernelDropped, id: 1 }]);
         assert!(status.rebuild_required.load(Ordering::Relaxed));
         // Only a fresh walk knows a file created after the loss.
         let late = root.join("sub/late.txt");
@@ -1215,12 +1329,8 @@ mod rebuild_tests {
         state.handle(command(true, reply));
         let _ = rx.recv().unwrap().unwrap();
         assert!(state.last_activity > old_activity);
-        state.maybe_recover();
-        assert!(state.repair.is_none(), "a user search still postpones repair");
 
         state.last_activity = old_activity;
-        state.recovery = RecoverySchedule::default();
-        state.recovery.due(Instant::now() - Duration::from_secs(31), true, Duration::from_secs(90), None);
         let (reply, rx) = bounded(1);
         state.handle(command(false, reply));
         let (outcome, _, revision) = rx.recv().unwrap().unwrap();
@@ -1230,8 +1340,9 @@ mod rebuild_tests {
         assert!(rx.recv().unwrap().is_some());
         assert_eq!(state.last_activity, old_activity, "automatic refresh and sort are not user activity");
         state.host = HostLoad::default(); // unknown first host sample permits repair
+        state.handle(command(true, bounded(1).0));
         state.maybe_recover();
-        assert!(state.repair.is_some(), "background refresh cannot starve idle repair");
+        assert!(state.repair.is_some(), "repair runs off the loop and does not wait for searches to stop");
         let cache = state.repair.as_ref().unwrap().done.recv_timeout(Duration::from_secs(30)).unwrap();
         assert!(cache.as_ref().is_some_and(|c| c.node_index_for_path(&late).is_some()));
         // Until the swap the loop still answers from the old snapshot.
@@ -1243,6 +1354,89 @@ mod rebuild_tests {
         assert!(!status.rebuild_required.load(Ordering::Relaxed));
         assert!(!rebuild_marker(&state.config).exists());
         assert!(state.cache.node_index_for_path(&late).is_some());
+        drop(state);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn delivery_loss_replays_history_and_falls_back_to_repair_when_the_history_has_the_gap() {
+        let dir = std::env::temp_dir().join(format!("sift-replay-test-{}", std::process::id()));
+        let root = dir.join("files");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = Config { root: root.clone(), ignore_paths: vec![], include_paths: vec![], support_dir: dir.clone() };
+        let status = Arc::new(Status::default());
+        let mut state = Loop { config: config.clone(), settings: Arc::new(Mutex::new(config)),
+            cache: SearchCache::walk_fs(&root), watcher: EventWatcher::noop(),
+            status: status.clone(), history_done: true, last_activity: Instant::now(), last_flush: None,
+            recovery: RecoverySchedule::default(), pending_rebuild_commit: false, watcher_since: (0, 0), last_clean_id: 0, replays: 0, episode_replays: 0, last_loss_id: 0,
+            repair: None, host: HostLoad::default() };
+        let base = state.cache.last_event_id();
+        let first = root.join("first.txt");
+        std::fs::write(&first, "1").unwrap();
+        state.apply_events(vec![FsEvent { path: first.clone(), flag: EventFlag::ItemCreated | EventFlag::ItemIsFile, id: base + 10 }]);
+        assert_eq!(state.last_clean_id, base + 10);
+
+        // Delivery loss: no rebuild, watermark rewound to the last clean ID, same-batch
+        // changes kept, and a replay stream started from there.
+        let second = root.join("second.txt");
+        std::fs::write(&second, "2").unwrap();
+        state.apply_events(vec![
+            FsEvent { path: root.clone(), flag: EventFlag::MustScanSubDirs | EventFlag::UserDropped, id: base + 20 },
+            FsEvent { path: second.clone(), flag: EventFlag::ItemCreated | EventFlag::ItemIsFile, id: base + 21 },
+        ]);
+        assert!(!status.rebuild_required.load(Ordering::Relaxed));
+        assert!(!rebuild_marker(&state.config).exists());
+        assert_eq!(state.cache.last_event_id(), base + 10);
+        assert_eq!(state.watcher_since.0, base + 10);
+        assert!(state.cache.node_index_for_path(&second).is_some());
+        assert_eq!((state.replays, status.history_replays.load(Ordering::Relaxed)), (1, 1));
+        assert!(std::fs::read_to_string(dir.join("rebuild.log")).unwrap().contains("replay 1 from="));
+        // A snapshot taken now records the pre-gap watermark, so a restart replays too.
+        assert!(state.flush_now_if_dirty().unwrap());
+
+        // The replay completes cleanly: the retry budget resets.
+        state.apply_events(vec![FsEvent { path: root.clone(), flag: EventFlag::HistoryDone, id: base + 30 }]);
+        assert_eq!(state.replays, 0);
+
+        // A gap stored in the history itself comes back on every replay: after two
+        // replays the background repair takes over.
+        for attempt in 1..=MAX_REPLAYS {
+            state.apply_events(vec![FsEvent { path: root.clone(), flag: EventFlag::MustScanSubDirs | EventFlag::UserDropped, id: base + 40 }]);
+            assert_eq!(state.replays, attempt);
+            assert!(!status.rebuild_required.load(Ordering::Relaxed));
+        }
+        state.apply_events(vec![FsEvent { path: root.clone(), flag: EventFlag::MustScanSubDirs | EventFlag::UserDropped, id: base + 40 }]);
+        assert!(status.rebuild_required.load(Ordering::Relaxed));
+        assert!(rebuild_marker(&state.config).exists());
+
+        // Sustained overload: every replay loses again but further on, so it keeps
+        // replaying past MAX_REPLAYS instead of walking the disk.
+        state.status.rebuild_required.store(false, Ordering::Relaxed);
+        state.replays = 0; state.episode_replays = 0; state.last_loss_id = 0;
+        for step in 0..(MAX_REPLAYS as u64 + 3) {
+            state.apply_events(vec![FsEvent { path: root.clone(), flag: EventFlag::MustScanSubDirs | EventFlag::UserDropped, id: base + 100 + step }]);
+            assert!(!status.rebuild_required.load(Ordering::Relaxed), "step {step}");
+            assert_eq!(state.replays, 1);
+        }
+        drop(state);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn kernel_loss_goes_straight_to_repair() {
+        let dir = std::env::temp_dir().join(format!("sift-kernel-loss-{}", std::process::id()));
+        let root = dir.join("files");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = Config { root: root.clone(), ignore_paths: vec![], include_paths: vec![], support_dir: dir.clone() };
+        let status = Arc::new(Status::default());
+        let mut state = Loop { config: config.clone(), settings: Arc::new(Mutex::new(config)),
+            cache: SearchCache::walk_fs(&root), watcher: EventWatcher::noop(),
+            status: status.clone(), history_done: true, last_activity: Instant::now(), last_flush: None,
+            recovery: RecoverySchedule::default(), pending_rebuild_commit: false, watcher_since: (0, 0), last_clean_id: 0, replays: 0, episode_replays: 0, last_loss_id: 0,
+            repair: None, host: HostLoad::default() };
+        state.apply_events(vec![FsEvent { path: root.clone(), flag: EventFlag::MustScanSubDirs | EventFlag::UserDropped | EventFlag::KernelDropped, id: 5 }]);
+        assert!(status.rebuild_required.load(Ordering::Relaxed));
+        assert_eq!(status.history_replays.load(Ordering::Relaxed), 0);
         drop(state);
         std::fs::remove_dir_all(&dir).unwrap();
     }
